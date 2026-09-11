@@ -1,0 +1,22 @@
+{
+  "name": "ark",
+  "version": "1.0.0",
+  "description": "Ark - Obsidian 知识工作台插件",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "check:css": "node ./scripts/check-css.mjs",
+    "test:unit": "node ./scripts/run-unit-tests.mjs",
+    "build": "node ./scripts/check-css.mjs && node ./scripts/run-unit-tests.mjs && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "deploy": "node ./scripts/deploy.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {}
+}

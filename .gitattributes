@@ -1,0 +1,11 @@
+# 统一换行归一：文本文件入库一律 LF，二进制按类型显式声明
+* text=auto
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.webm binary
+*.woff binary
+*.woff2 binary

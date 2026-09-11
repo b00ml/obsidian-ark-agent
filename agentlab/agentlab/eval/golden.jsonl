@@ -1,0 +1,3 @@
+{"id":"q1","question":"对比 X 与 Y 两篇笔记的结论差异是什么","expected_refs":["X.md","Y.md"],"expected_contexts":["X.md 的核心结论是采用向量检索","Y.md 的核心结论是采用关键词检索"],"min_relevance":0.8}
+{"id":"q2","question":"obsidian 知识库如何维护 wikilink 图谱","expected_refs":["图谱方法论.md"],"expected_contexts":["wikilink 双向链接构成知识图谱","每次新增笔记都要补反链"],"min_relevance":0.8}
+{"id":"q3","question":"bili 视频转写如何做断点续传","expected_refs":["转写.md"],"expected_contexts":["whisper 每转写5段写入缓存","中断后从断点继续"],"min_relevance":0.8}

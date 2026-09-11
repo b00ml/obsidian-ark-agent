@@ -1,0 +1,15 @@
+{
+  "vault_path": "C:/path/to/your/obsidian-vault",
+  "project_root": "C:/path/to/obsidian-ark-agent",
+  "python": ".venv/Scripts/python.exe",
+  "brain_dir": ".agent-brain",
+  "cookie_path": "bili_summarizer/bilibili_cookie.json",
+  "visual_models_path": "bili_summarizer/config/visual_models.json",
+  "queue_path": "inbox/queue.jsonl",
+  "seen_path": "inbox/seen.txt",
+  "queue_db_path": "inbox/queue.db",
+  "inbox_config_path": "inbox_collector/config.json",
+  "output_dir": ".agent-brain/outputs",
+  "task_state_path": "agentlab/runtime/state.db",
+  "obsidian_cli": {"bin": "obsidian", "timeout": 15}
+}

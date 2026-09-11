@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentlab"
+version = "0.1.0"
+description = "自研轻量可复用 Python Agent 框架：Agent = LLM + Tools + Loop，内核克制、能力外置。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "aiohttp>=3.9",
+    "pydantic>=2.0",
+    "httpx>=0.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+vector = ["sqlite-vec>=0.1.6"]  # 可选加速：rag 向量检索用 C 余弦；未装自动退化为纯 Python
+
+[project.scripts]
+agentlab = "agentlab.runtime.cli:main"
+
+[tool.setuptools]
+packages = [
+    "agentlab",
+    "agentlab.core",
+    "agentlab.tools",
+    "agentlab.tools.connectors",
+    "agentlab.memory",
+    "agentlab.runtime",
+    "agentlab.prompts",
+    "agentlab.rag",
+    "agentlab.eval",
+]
+
+[tool.setuptools.package-data]
+agentlab = ["prompts/*.st", "eval/*.jsonl"]

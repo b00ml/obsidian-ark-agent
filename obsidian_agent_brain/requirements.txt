@@ -1,0 +1,4 @@
+# obsidian_agent_brain MCP server 依赖
+# 安装: .venv\Scripts\python.exe -m pip install -r obsidian_agent_brain/requirements.txt
+mcp>=1.9,<2
+pydantic>=2.11

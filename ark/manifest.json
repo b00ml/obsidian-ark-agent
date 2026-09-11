@@ -1,0 +1,9 @@
+{
+  "id": "ark",
+  "name": "Ark",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Obsidian 知识工作台：面板式工作流与 AI 助手。",
+  "author": "b00ml",
+  "isDesktopOnly": true
+}

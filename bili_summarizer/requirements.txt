@@ -1,0 +1,9 @@
+# B站视频字幕提取工具依赖
+yt-dlp>=2024.1
+faster-whisper>=1.0
+requests>=2.25
+imageio-ffmpeg>=0.5  # 可选: 未安装系统ffmpeg时提供静态二进制
+Pillow>=9.0          # 多模态: 网格图拼接 (video_frames.py)
+bilibili-api-python>=17  # WBI 签名稳定取字幕（配合 venv 内 aiohttp）
+nvidia-cublas-cu12 ; platform_machine == 'AMD64'  # GPU Whisper 运行库 cublas64_12.dll
+nvidia-cudnn-cu12  ; platform_machine == 'AMD64'  # GPU Whisper 运行库 cudnn64_9.dll

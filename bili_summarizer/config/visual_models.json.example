@@ -1,0 +1,26 @@
+{
+  "default": {
+    "api_base": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "model": "deepseek-chat"
+  },
+  "visual": {
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "",
+    "model": "qwen-vl-max"
+  },
+  "grid": {
+    "cols": 3,
+    "rows": 3,
+    "cell_width": 640,
+    "cell_height": 360,
+    "frame_interval": 10,
+    "quality": 85,
+    "max_grid_images": 10
+  },
+  "screenshot": {
+    "max_count": 5,
+    "width": 1280,
+    "quality": 2
+  }
+}

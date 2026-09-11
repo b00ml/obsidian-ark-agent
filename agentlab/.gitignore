@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# 密钥不入库（对齐 AGENTS.md 红线）
+config/config.json
+**/config.json
+
+# trace / 运行产物
+logs/
+output/

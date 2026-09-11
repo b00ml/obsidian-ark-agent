@@ -1,0 +1,1 @@
+"""connectors 子包：唯一 import brain 业务函数的边界（docs/03 §3.3、02 依赖规则）。"""

@@ -1,0 +1,138 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project-specific: secrets (NEVER commit)
+bili_summarizer/bilibili_cookie.json
+bili_summarizer/config/visual_models.json
+inbox_collector/config.json
+obsidian_agent_brain/config.json
+
+# Project-specific: Agent Mail CLI credentials (OAuth token)
+.agently-cli/
+
+# Project-specific: runtime artifacts
+bili_summarizer/temp_audio.*
+bili_summarizer/temp_video.*
+bili_summarizer/frames_tmp/
+bili_summarizer/screenshots/
+bili_summarizer/*.cache
+bili_summarizer/transcript_*.txt
+bili_summarizer/meta_*.json
+
+# Project-specific: queue runtime
+inbox/queue.jsonl
+inbox/seen.txt
+inbox/queue.db
+inbox/queue.db-wal
+inbox/queue.db-shm
+
+# Project-specific: test fixtures (MCP test 临时 Vault)
+obsidian_agent_brain/.test_vault/
+
+# Project-specific: brain 数据目录（正常落在 Vault 内；出现在仓库里说明路径解析退化了）
+**/.agent-brain/
+
+# Project-specific: run logs
+logs/
+agentlab/runtime/state.db
+agentlab/runtime/state.db-wal
+agentlab/runtime/state.db-shm
+
+# Project-specific: Obsidian plugin build artifacts (源码保留，产物不入库)
+obsidian-plugin/node_modules/
+obsidian-plugin/main.js
+obsidian-plugin/styles.css
+
+# Project-specific: Obsidian Vault (never commit vault contents)
+*.md.bak
+
+# —— 2026-09-05 首次入库补充（盘点后新增，勿删）——
+
+# 密钥：agentlab 运行配置（含 LLM API Key，入库用 config.example.json 模板）
+agentlab/config/config.json
+
+# 第三方参考源码（自带 .git、32MB，仅供设计吸收，不随本仓库分发）
+pi_agent_src/
+
+# 插件分析素材：只入库自产分析稿（分析/）与样式片段；原插件包与大媒体不入库
+插件/BridgeOS/
+插件/apex-dashboard/
+插件/背景视频/
+
+# 本地运行/临时产物与垃圾目录
+AppData/
+_backup/
+.tmp/
+.tmp_bridge_re/
+.tmp_bridge_re_probe.js
+*.log
+*.pid
+.pytest_cache/
+Inbox/
+
+# ark 构建产物与依赖（styles.css 是源码，保留入库）
+node_modules/
+ark/main.js
+
+# ark UI 验证环境产物（.uiharness 源码保留，截图/bundle 不入库）
+ark/.uiharness/bundle.js
+ark/.uiharness/shots/
+ark/.uiharness/report.json
+ark/.uiharness/probe.css
+ark/.uiharness/probe.html
+ark/.uiharness/__pycache__/
+ark/.unit-dist/
+
+# 临时产物与凭据（禁止入库）
+bili_summarizer/temp_cookies.txt
+temp_mcp_full.txt
+req_download.bin
+
+# 测试瞬时产物（unittest 落在 cwd 的三件套样例）
+bili_summarizer/测试视频*
+temp_cookies
+
+# Public distribution: exclude private workspace state and historical material
+/.ai/
+/.skills/
+/.trae/
+/skills/
+/插件/
+/docs/
+/AGENTS.md
+/CLAUDE.md
+/ARCHITECTURE.md
+/COMPARISON.md
+/DESIGN-MULTIMODAL.md
+/mcp.config.json
+/agentlab/.agent-brain/
+/agentlab/_*
+/agentlab/docs/
+/obsidian_agent_brain/AGENT_RULES.md
+/ark/*.md
+/ark/ui-prototype.html
+/ark/prototype/
+/ark/.uiharness/

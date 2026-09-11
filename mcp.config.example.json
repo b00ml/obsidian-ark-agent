@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "obsidian-brain": {
+      "command": "python",
+      "args": [
+        "obsidian_agent_brain/mcp_server.py"
+      ],
+      "env": {
+        "OBSIDIAN_VAULT_PATH": "C:/path/to/your/vault"
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "whitelist_domains": [
+    "bilibili.com",
+    "b23.tv",
+    "mp.weixin.qq.com",
+    "weixin.qq.com"
+  ],
+  "queue_path": "inbox/queue.jsonl",
+  "seen_path": "inbox/seen.txt",
+  "queue_db_path": "inbox/queue.db",
+  "max_fetch": 20,
+  "log_level": "INFO"
+}
