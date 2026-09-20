@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import shutil
@@ -272,11 +273,33 @@ class AcpClient:
                             proc.kill()
                         except (ProcessLookupError, RuntimeError):
                             pass
+            # Close the asyncio streams as well as the transport.  On Windows
+            # the Proactor pipe wrappers can otherwise retain a handle to the
+            # child cwd after Popen.wait() has returned, making an immediate
+            # TemporaryDirectory cleanup fail with WinError 32.
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
             _close_transport(proc, self._raw_proc, close_raw=cross_loop)
             if not cross_loop:
-                # Let the owner loop run the transport's pipe-close callbacks
-                # before callers remove a temporary working directory.
+                # Let owner-loop pipe callbacks and finalizers run before the
+                # caller removes a temporary cwd. Two turns are intentional:
+                # Proactor transports may schedule connection_lost indirectly.
                 await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            else:
+                # No owner loop remains to service callbacks. Yield once after
+                # closing raw handles so the current loop can release wrappers.
+                await asyncio.sleep(0)
+            # A Proactor transport may only become unreachable after the close
+            # callbacks above. Collect here while the caller is still inside
+            # the lifecycle boundary; otherwise Windows can keep the child cwd
+            # locked until a later unrelated GC cycle.
+            if os.name == "nt":
+                gc.collect()
         self._raw_proc = None
         self._fail_pending(AcpError("ACP 连接已关闭"))
 

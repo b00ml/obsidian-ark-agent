@@ -6,6 +6,7 @@ Hermes 兼容事件翻译是否正确。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -17,10 +18,12 @@ import urllib.error
 
 from agentlab.runtime.serve import (
     Serve, _Sink, _history, _run_agent, _sse, _serve_confirm, _persist_delta,
+    _finish_task_state,
 )
 from agentlab.memory.session_store import InMemorySessionStorage, JsonlSessionStorage
 from agentlab.core.agent import Agent
 from agentlab.core.loop import AgentResult
+from agentlab.core.events import ToolEnd
 from agentlab.core.message import TokenUsage, Message
 from agentlab.core.llm import LLMProvider, LLMResponse
 
@@ -29,16 +32,33 @@ class FakeRunner:
     def __init__(self, sink):
         self.sink = sink
         self.registry = _FakeRegistry()
+        self._handlers: dict = {}
+
+    def on(self, ev, cb):
+        # 事件订阅（对齐真实 runner）：测试用它验证 serve 侧 trace 挂钩（OPT-216）
+        self._handlers[ev] = cb
+
+    def _emit(self, ev, payload):
+        cb = self._handlers.get(ev)
+        if cb:
+            cb(payload)
 
     async def run(self, agent, user_input, ctx=None, cfg=None, hooks=None):
+        from agentlab.core.events import Ev, ToolStart
         self.sink.tool_start("vault_search")
+        self._emit(Ev.TOOL_START, ToolStart(name="vault_search",
+                                            arguments='{"query": "测试"}'))
         self.sink.tool_end("vault_search", '{"total": 2}')
+        self._emit(Ev.TOOL_END, ToolEnd(name="vault_search", result='{"total": 2}'))
         self.sink.text(f"已检索，回复：{user_input}")
         return AgentResult(
             final_output=f"已检索，回复：{user_input}",
             stop_reason="done",
             messages=[],
             usage=TokenUsage(input_tokens=10, output_tokens=20),
+            run_trace={"counters": {"rounds": 2, "llm_calls": 2,
+                                     "tool_calls": 1, "retries": 0,
+                                     "plan_steps": 0}},
         )
 
 
@@ -53,6 +73,9 @@ class FakeSlowRunner(FakeRunner):
             stop_reason="done",
             messages=[],
             usage=TokenUsage(input_tokens=5, output_tokens=5),
+            run_trace={"counters": {"rounds": 1, "llm_calls": 1,
+                                     "tool_calls": 0, "retries": 0,
+                                     "plan_steps": 0}},
         )
 
 
@@ -227,6 +250,24 @@ class TestServeProto(unittest.TestCase):
         self.assertEqual(item["arguments"], payload,
                          "工具入参必须原样透传，而不是空对象")
 
+    def test_build_backend_forwards_rag_llm_to_registry(self):
+        """答案 probe 必须给 rag_assess 注入 provider，而非走无 LLM 降级。"""
+        from unittest import mock
+
+        from agentlab.runtime import serve as serve_mod
+
+        registry = mock.Mock(all=lambda: [])
+        fake_runner = mock.Mock(registry=registry)
+        rag_llm = object()
+        with mock.patch("agentlab.runtime.cli._build_registry",
+                        return_value=(registry, 0)) as build_registry, \
+                mock.patch("agentlab.runtime.cli._build_runner", return_value=fake_runner), \
+                mock.patch("agentlab.tools.rag_tools.build_p2_store", return_value=None), \
+                mock.patch("agentlab.tools.rag_tools.build_vector_index", return_value=None):
+            serve_mod._build_backend(_tmp_cfg(), rag_llm=rag_llm)
+
+        self.assertIs(build_registry.call_args.kwargs["rag_llm"], rag_llm)
+
 
 
 class TestServeConfirm(unittest.TestCase):
@@ -393,6 +434,79 @@ class TestRunAgentRangeGateway(unittest.TestCase):
             session_id="s-1"))
         self.assertIsNone(captured.get("recorder"))
 
+    def test_binds_request_retrieval_scope_and_restores_it(self):
+        captured = {}
+
+        class CapRunner(FakeRunner):
+            async def run(self, agent, user_input, ctx=None, cfg=None, hooks=None):
+                from agentlab.contracts import current_retrieval_scope
+                scope = current_retrieval_scope()
+                captured["scope"] = (scope.project_id, scope.session_id)
+                return await super().run(agent, user_input, ctx=ctx, cfg=cfg, hooks=hooks)
+
+        from agentlab.contracts import current_retrieval_scope
+        self.assertEqual((current_retrieval_scope().project_id,
+                          current_retrieval_scope().session_id), ("", ""))
+        asyncio.run(_run_agent(
+            _tmp_cfg(), lambda sink: CapRunner(sink), [], "问题", _Sink(lambda _: None),
+            session_id="s-1", project_id="p-1",
+        ))
+        self.assertEqual(captured["scope"], ("p-1", "s-1"))
+        self.assertEqual((current_retrieval_scope().project_id,
+                          current_retrieval_scope().session_id), ("", ""))
+
+    def test_optional_task_state_checkpoint_records_request_lifecycle(self):
+        cfg = _tmp_cfg()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.context.task_state_path = os.path.join(tmp, "task-state.db")
+            asyncio.run(_run_agent(
+                cfg, lambda sink: FakeRunner(sink), [], "任务目标", _Sink(lambda _: None),
+                session_id="s-state", project_id="p-state", run_id="r-state",
+            ))
+            from agentlab.runtime.task_state import TaskStateStore
+            state = TaskStateStore(cfg.context.task_state_path).get("r-state")
+            self.assertEqual(state.phase, "DONE")
+            self.assertEqual(state.session_id, "s-state")
+            self.assertEqual(state.project_id, "p-state")
+            self.assertEqual(state.core_intent["goal"], "任务目标")
+
+    def test_finish_refreshes_task_state_after_tool_ledger_updates(self):
+        from agentlab.runtime.task_state import TaskStateStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStateStore(os.path.join(tmp, "task-state.db"))
+            state = store.ensure("r-ledger")
+            state = store.transition("r-ledger", "PLANNING")
+            state = store.transition("r-ledger", "EXECUTING")
+            stale_snapshot = state
+            store.plan_tool(
+                "r-ledger", operation_id="op-1", tool_name="vault_write",
+                permission="write", side_effects="write", idempotent=True,
+            )
+            store.update_tool("r-ledger", "op-1", "running")
+            store.update_tool("r-ledger", "op-1", "succeeded")
+
+            saved = _finish_task_state(store, stale_snapshot)
+            self.assertEqual(saved.phase, "DONE")
+            self.assertEqual(store.get("r-ledger").phase, "DONE")
+
+    def test_run_agent_returns_answer_gate_summary(self):
+        class GateRunner(FakeRunner):
+            async def run(self, agent, user_input, ctx=None, cfg=None, hooks=None):
+                return AgentResult(
+                    final_output="有证据的回答",
+                    stop_reason="done",
+                    messages=[],
+                    usage=TokenUsage(input_tokens=1, output_tokens=1),
+                    answer_gate={"mode": "shadow", "reasons": []},
+                )
+
+        result = asyncio.run(_run_agent(
+            _tmp_cfg(), lambda sink: GateRunner(sink), [], "问题",
+            _Sink(lambda _: None), session_id="s-gate",
+        ))
+        self.assertEqual(result["answer_gate"], {"mode": "shadow", "reasons": []})
+
 
 class TestCancelPropagation(unittest.TestCase):
     """S3 取消传播（asyncio 版）：_SSEWriter 写流异常（客户端断连）置位 cancel 并上抛。"""
@@ -486,8 +600,13 @@ class TestServeIdempotentReplay(unittest.TestCase):
 
         cfg = _tmp_cfg(); cfg.serve.port = port
         factory = lambda: (lambda sink: _CountingRunner(sink))  # noqa: E731
+        # 固定 request_id 用例必须用独立幂等库：默认持久背板（OPT-214）会让上一轮
+        # 运行的 "idem-aa" 命中重放，破坏测试隔离
+        import tempfile as _tf
+        idem_dir = _tf.mkdtemp(prefix="idem-test-")
         s = Serve(cfg, port=port, host="127.0.0.1", build_factory=factory,
-                  session_store=InMemorySessionStorage())
+                  session_store=InMemorySessionStorage(),
+                  idem_store_path=os.path.join(idem_dir, "idem.db"))
         httpd = s.start()
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
@@ -543,7 +662,8 @@ class TestServeHTTP(unittest.TestCase):
         /v1/runs 与 /v1/agents 预检是 405 —— Ark 侧表现为"无法连接 Agent 内核"。
         """
         for path in ("/v1/agents", "/v1/runs", "/v1/runs/abc", "/v1/sessions/s-1",
-                     "/v1/context-status"):
+                     "/v1/context-status", "/v1/tasks/task-1/operations",
+                     "/v1/tasks/task-1/operations/op-1/reconcile"):
             code, allow_headers = _options(f"http://127.0.0.1:{self.port}{path}")
             self.assertEqual(code, 204, f"{path} 预检未通过")
             self.assertIn("authorization", allow_headers.lower())
@@ -573,6 +693,43 @@ class TestServeHTTP(unittest.TestCase):
         self.assertTrue(r2.get("cached"))
         self.assertEqual(r2["transcript"], r1["transcript"])
         bt._TRANSCRIPT_CACHE.clear()
+
+    def test_visual_cache_reuses_result(self):
+        # OPT-218 真机回归：bili_visual 含截帧+视觉模型约 4 分钟，serve 断连重试后
+        # 同 bvid 重跑 = 全部重做（实测第一次 run 237s 白费后重跑又 239s）。缓存命中。
+        from agentlab.tools.connectors import brain_tools as bt
+        calls = []
+        def fake(config, bvid=None, **kw):
+            calls.append(bvid)
+            return {"bvid": bvid, "note": "Inbox/x-visual.md", "grids": 3}
+        cached = bt._with_key_cache(fake, bt._VISUAL_CACHE, "bvid")
+        bt._VISUAL_CACHE.clear()
+        r1 = cached({}, "BV01")
+        r2 = cached({}, "BV01")
+        self.assertEqual(calls, ["BV01"])  # 第二次命中缓存，底层不再执行
+        self.assertTrue(r2.get("cached"))
+        self.assertEqual(r2["note"], r1["note"])
+        bt._VISUAL_CACHE.clear()
+
+
+    def test_article_cache_by_url(self):
+        # OPT-222 真机回归："处理收件箱"重发循环中同 URL 的 article_summarize
+        # 重复抓取+总结烧钱；url 参数名与 bvid 不同，key 必须正确提取
+        from agentlab.tools.connectors import brain_tools as bt
+        calls = []
+        def fake(config, url=None, **kw):
+            calls.append(url)
+            return {"url": url, "note": "Inbox/a-文章.md"}
+        cached = bt._with_key_cache(fake, bt._ARTICLE_CACHE, "url")
+        bt._ARTICLE_CACHE.clear()
+        r1 = cached({}, "https://mp.weixin.qq.com/s/abc")
+        r2 = cached({}, "https://mp.weixin.qq.com/s/abc")
+        r3 = cached({}, "https://mp.weixin.qq.com/s/other")
+        self.assertEqual(calls, ["https://mp.weixin.qq.com/s/abc",
+                                 "https://mp.weixin.qq.com/s/other"])
+        self.assertTrue(r2.get("cached"))
+        self.assertFalse(r3.get("cached"))
+        bt._ARTICLE_CACHE.clear()
 
     def test_stream_events_and_done(self):
         code, body = _post(f"http://127.0.0.1:{self.port}/v1/responses",
@@ -766,6 +923,7 @@ class TestContextStatusAndHistory(unittest.TestCase):
         finally:
             httpd.shutdown(); httpd.server_close()
 
+
     def test_context_status_unauthorized(self):
         s, httpd, port = _make_serve()
         try:
@@ -787,6 +945,81 @@ class TestContextStatusAndHistory(unittest.TestCase):
         finally:
             httpd.shutdown(); httpd.server_close()
 
+
+class TestTaskStateHTTP(unittest.TestCase):
+    """P2-02：恢复账本只允许外部证据结算 unknown，不触发工具重放。"""
+
+    def setUp(self):
+        from agentlab.runtime.task_state import TaskStateStore
+
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = _tmp_cfg()
+        cfg.context.task_state_path = os.path.join(self.tmp.name, "task-state.db")
+        self.store = TaskStateStore(cfg.context.task_state_path)
+        self.store.ensure("task-reconcile")
+        self.store.plan_tool(
+            "task-reconcile", operation_id="op-1", tool_name="external_write",
+            permission="danger", side_effects="external", idempotent=False,
+        )
+        self.store.update_tool("task-reconcile", "op-1", "unknown")
+        factory = lambda: (lambda sink: FakeRunner(sink))  # noqa: E731
+        self.serve = Serve(
+            cfg, port=18790, host="127.0.0.1", build_factory=factory,
+            session_store=InMemorySessionStorage(),
+        )
+        self.httpd = self.serve.start()
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = "http://127.0.0.1:18790/v1/tasks/task-reconcile/operations"
+
+    def tearDown(self):
+        self.serve.shutdown()
+        self.thread.join(timeout=2)
+        self.tmp.cleanup()
+
+    def _get_auth(self, token="agentlab-dev"):
+        req = urllib.request.Request(
+            self.url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    def test_operations_require_auth_and_list_unknown(self):
+        code, _ = self._get_auth(token="wrong")
+        self.assertEqual(code, 401)
+        code, body = self._get_auth()
+        self.assertEqual(code, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["task_id"], "task-reconcile")
+        self.assertEqual(payload["operations"][0]["operation_id"], "op-1")
+        self.assertEqual(payload["operations"][0]["status"], "unknown")
+
+    def test_reconcile_requires_external_evidence_and_is_terminal(self):
+        code, _ = _post(self.url + "/op-1/reconcile", {
+            "status": "succeeded", "source": "remote", "evidence_ref": "op:1",
+            "unexpected": True,
+        })
+        self.assertEqual(code, 400)
+        self.assertEqual(self.store.pending_operations("task-reconcile")[0]["status"], "unknown")
+
+        version = self.store.get("task-reconcile").state_version
+        code, body = _post(self.url + "/op-1/reconcile", {
+            "status": "succeeded", "source": "remote-api",
+            "evidence_ref": "remote:operations/op-1", "result_ref": "artifact:op-1",
+            "expected_version": version,
+        })
+        self.assertEqual(code, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["operation"]["status"], "succeeded")
+        self.assertEqual(payload["operation"]["reconciliation"]["source"], "remote-api")
+        self.assertEqual(self.store.pending_operations("task-reconcile"), [])
+
+        code, _ = _post(self.url + "/op-1/reconcile", {
+            "status": "failed", "source": "remote-api", "evidence_ref": "remote:op-1",
+        })
+        self.assertEqual(code, 409)
 
 # ── P2-2/OPT-121：multi-agent 并行作答 + 主 Agent 汇总 ──
 
@@ -1322,6 +1555,9 @@ class TestRunsEndpoint(unittest.TestCase):
             self.assertIn("trace_id", mine)
             self.assertIn("time", mine)
             self.assertIn("steps", mine)
+            self.assertEqual(mine["steps"], 2)
+            self.assertEqual(mine["llm_calls"], 2)
+            self.assertEqual(mine["tool_calls"], 1)
         finally:
             httpd.shutdown(); httpd.server_close()
 
@@ -1398,3 +1634,105 @@ class TestDeleteSessionEndpoint(unittest.TestCase):
         self.assertTrue(st.delete("s1"))
         self.assertFalse(st.delete("s1"))
         self.assertEqual(list(Path(d).glob("*s1*")), [])
+
+
+class TestServeTraceP102(unittest.TestCase):
+    """OPT-216 P1-02：run trace 补 duration_ms/model/error_code，tool start 记参数指纹。"""
+
+    def _serve(self, factory, port, trace_dir):
+        cfg = _tmp_cfg()
+        cfg.trace_dir = trace_dir
+        s = Serve(cfg, port=port, host="127.0.0.1", build_factory=factory,
+                  session_store=InMemorySessionStorage())
+        httpd = s.start()
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return s, httpd
+
+    def _read_events(self, trace_dir):
+        files = os.listdir(trace_dir)
+        assert files, "trace 目录为空"
+        with open(os.path.join(trace_dir, files[0]), encoding="utf-8") as f:
+            return [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+
+    def test_run_trace_has_duration_model_and_tool_args_hash(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        s, httpd = self._serve(lambda: (lambda sink: FakeRunner(sink)), 18781, tmp)
+        try:
+            time.sleep(0.15)
+            code, _ = _post(f"http://127.0.0.1:18781/v1/responses",
+                            {"input": [{"role": "user", "content": "查一下"}]})
+            self.assertEqual(code, 200)
+            events = self._read_events(tmp)
+            run = next(e for e in events if e.get("type") == "run")
+            self.assertIn("duration_ms", run)
+            self.assertIsInstance(run["duration_ms"], int)
+            self.assertIn("model", run)
+            self.assertEqual(run["stop_reason"], "done")
+            start = next(e for e in events
+                         if e.get("type") == "tool" and e.get("phase") == "start")
+            self.assertEqual(start["arguments_hash"],
+                             hashlib.sha1('{"query": "测试"}'.encode("utf-8")).hexdigest()[:12])
+        finally:
+            httpd.shutdown(); httpd.server_close()
+
+    def test_run_trace_error_code_on_failure(self):
+        import tempfile
+
+        from agentlab.core.errors import AgentError
+
+        class FailingRunner:
+            def __init__(self, sink):
+                self.sink = sink
+                self.registry = _FakeRegistry()
+
+            def on(self, ev, cb):
+                pass
+
+            async def run(self, agent, user_input, ctx=None, cfg=None, hooks=None):
+                raise AgentError("AGENT_TOOL_PERMISSION", "拒绝执行 vault_write")
+
+        tmp = tempfile.mkdtemp()
+        s, httpd = self._serve(lambda: (lambda sink: FailingRunner(sink)), 18782, tmp)
+        try:
+            time.sleep(0.15)
+            try:
+                _post(f"http://127.0.0.1:18782/v1/responses",
+                      {"input": [{"role": "user", "content": "写一下"}]})
+            except urllib.error.HTTPError:
+                pass  # 500/错误响应均可——重点是 trace 留 error_code
+            events = self._read_events(tmp)
+            run = next(e for e in events if e.get("type") == "run")
+            self.assertEqual(run["stop_reason"], "error")
+            self.assertEqual(run["error_code"], "AGENT_TOOL_PERMISSION")
+            self.assertIn("duration_ms", run)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+
+
+class TestVisualToolGating(unittest.TestCase):
+    """OPT-219：视觉工具按需启用——用户明确提出视觉意图才进工具面。"""
+
+    def test_no_visual_intent_hides_visual_tools(self):
+        from agentlab.runtime.serve import _visual_tool_filter
+        f = _visual_tool_filter("BV1AdokBNENj，生成笔记")
+        self.assertIsNotNone(f)
+
+        class T:
+            def __init__(self, name):
+                self.name = name
+
+        self.assertFalse(f(T("bili_visual")))
+        self.assertFalse(f(T("bili_screenshot")))
+        self.assertTrue(f(T("bili_transcribe")))
+        self.assertTrue(f(T("vault_search")))
+
+    def test_visual_intent_enables_visual_tools(self):
+        from agentlab.runtime.serve import _visual_tool_filter
+        for text in ("BV1xx 做视觉分析", "帮我截图关键画面", "截几张图", "Do a visual analysis"):
+            self.assertIsNone(_visual_tool_filter(text), f"应识别视觉意图: {text}")
+
+    def test_empty_input_hides_visual_tools(self):
+        from agentlab.runtime.serve import _visual_tool_filter
+        self.assertIsNotNone(_visual_tool_filter(""))
+        self.assertIsNotNone(_visual_tool_filter(None))

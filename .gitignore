@@ -131,6 +131,33 @@ temp_cookies
 /agentlab/.agent-brain/
 /agentlab/_*
 /agentlab/docs/
+
+# agentlab local runtime, evaluation, and database artifacts
+/agentlab/.tmp/
+/agentlab/*.log
+/agentlab/*.txt
+/agentlab/*.pid
+/agentlab/**/*.log
+/agentlab/**/*.txt
+/agentlab/**/*.pid
+/agentlab/**/*.db
+/agentlab/**/*.db-wal
+/agentlab/**/*.db-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# agentlab local runtime, evaluation, and database artifacts
+/agentlab/.tmp/
+/agentlab/*.log
+/agentlab/*.txt
+/agentlab/*.pid
+/agentlab/**/*.log
+/agentlab/**/*.txt
+/agentlab/**/*.pid
+/agentlab/**/*.db
+/agentlab/**/*.db-wal
+/agentlab/**/*.db-shm
 /obsidian_agent_brain/AGENT_RULES.md
 /ark/*.md
 /ark/ui-prototype.html

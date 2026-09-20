@@ -7,6 +7,8 @@
 路由：
   GET  /health         健康检查（ark probe 读 j.version）
   POST /v1/responses    流式 agent 运行（Bearer 鉴权；body.multi 给定 → P2-2 multi-agent 并行+汇总）
+  GET  /v1/tasks/{task_id}/operations  查询待核验工具账本
+  POST /v1/tasks/{task_id}/operations/{operation_id}/reconcile  写入外部核验结果
 
 HTTP 底层用 aiohttp（asyncio），消除旧版 "线程壳包 asyncio" 的矛盾：
 agent 运行、SSE 写流、进度心跳全跑在同一个事件循环里，天然并发生长连接。
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -77,11 +80,12 @@ def _load_cfg(config_path: str | None = None):
     return _cfg.load_config(path=config_path)
 
 
-def _attach_depository(cfg, run_cfg):
+def _attach_depository(cfg, run_cfg, source_session: str = "", project_id: str = ""):
     """S6 记忆调度接线：config.memory 配置且 brain 可用 → 挂 MemoryStore 作为异步沉淀仓。
 
     brain 不可用（导入失败/未就绪）→ 返回原 run_cfg（depository=None，等效关闭），
     不抛错、不阻断请求（对齐记忆 store 的降级惯例）。
+    OPT-224：source_session/project_id 注入记忆仓——沉淀带会话锚并可按项目隔离。
     """
     if not getattr(cfg.limits, "memorize_every", 0):
         return run_cfg
@@ -89,9 +93,17 @@ def _attach_depository(cfg, run_cfg):
         from agentlab.memory.store import MemoryStore
         from agentlab.tools.connectors.brain_tools import load_brain_config
 
-        depo = MemoryStore(load_brain_config(cfg.model_dump()),
+        brain_cfg = load_brain_config(cfg.model_dump()) or {}
+        if project_id:
+            brain_cfg["project_id"] = project_id  # brain memory_commit/query 读此键
+        try:
+            brain_cfg["memory_policy"] = cfg.memory.model_dump()
+        except AttributeError:
+            pass
+        depo = MemoryStore(brain_cfg,
                            per_item_chars=cfg.limits.memory_item_chars,
-                           decay_half_life_days=cfg.memory.decay_half_life_days)
+                           decay_half_life_days=cfg.memory.decay_half_life_days,
+                           source_session=source_session)
         if depo.available:
             run_cfg.depository = depo
             # #10①/OPT-123：LLM 语义提取器（importance 打分）；无 key/构造失败回退触发词路
@@ -109,6 +121,101 @@ def _attach_depository(cfg, run_cfg):
     except Exception as e:  # 记忆仓初始化失败仅是能力降级，不强耦合请求主链路
         _slog("MEMORY", "depository unavailable: %s", e)
     return run_cfg
+
+
+def _task_state_store(cfg):
+    """Build the optional structured checkpoint store from context config."""
+    context_cfg = getattr(cfg, "context", None)
+    configured = str(getattr(context_cfg, "task_state_path", "") or "").strip()
+    if not configured:
+        return None
+    try:
+        from agentlab.runtime.task_state import TaskStateStore
+
+        path = Path(configured)
+        if not path.is_absolute():
+            path = _PROJECT_ROOT / path
+        return TaskStateStore(path)
+    except Exception as exc:  # noqa: BLE001 - checkpoint is an optional shadow aid
+        _slog("TASK_STATE", "unavailable: %s", exc)
+        return None
+
+
+def _begin_task_state(cfg, task_id: str, *, session_id: str = "",
+                      project_id: str = "", goal: str = ""):
+    store = _task_state_store(cfg)
+    if store is None or not task_id:
+        return None, None
+    try:
+        state = store.ensure(
+            task_id, session_id=session_id, project_id=project_id,
+            core_intent={"goal": (goal or "")[:500]},
+        )
+        # A crashed worker may leave a planned/running external side effect.
+        # Mark it unknown before the new run so the Runner cannot silently
+        # replay a non-idempotent operation.
+        store.recover_pending_tools(task_id, stale_after_seconds=300)
+        # Query deterministic local artifacts before the Runner sees the task.
+        # Unknown or unsupported operations remain a manual recovery barrier;
+        # this never dispatches a tool or infers success from the checkpoint.
+        try:
+            from agentlab.runtime.operation_verifier import reconcile_unknown_operations
+            reconcile_unknown_operations(
+                store, task_id, vault_root=getattr(cfg, "vault_root", ""),
+                project_root=_PROJECT_ROOT,
+                remote_config=getattr(getattr(cfg, "remote_operation", None), "model_dump", lambda: None)(),
+            )
+        except Exception as exc:  # verifier is conservative and optional
+            _slog("TASK_STATE", "external verification unavailable: %s", exc)
+        state = store.get(task_id) or state
+        if state.phase in {"DONE", "ERROR"}:
+            state = store.transition(task_id, "PLANNING", reason="new request")
+        elif state.phase == "WAITING_USER":
+            # A user reply resumes the same task through a fresh planning
+            # checkpoint before execution; finishing directly from
+            # WAITING_USER is intentionally illegal in the state machine.
+            state = store.transition(task_id, "PLANNING", reason="user reply")
+        if state.phase == "IDLE":
+            state = store.transition(task_id, "PLANNING", reason="request received")
+        if state.phase == "PLANNING":
+            state = store.transition(task_id, "EXECUTING", reason="agent started")
+        return store, state
+    except Exception as exc:  # noqa: BLE001 - state shadow must not block serving
+        _slog("TASK_STATE", "begin failed: %s", exc)
+        return None, None
+
+
+def _finish_task_state(store, state, *, stop_reason: str = "", error: str = "",
+                       context_plan=None):
+    if store is None or state is None:
+        return None
+    try:
+        # Runner tool-ledger checkpoints advance the optimistic-lock version
+        # during a run.  Refresh before settling so a stale begin snapshot
+        # cannot leave the task stuck in EXECUTING after a successful tool.
+        latest = store.get(state.task_id) or state
+        phase = "CANCELLED" if stop_reason in {"aborted", "cancelled"} else (
+            "ERROR" if error else "DONE"
+        )
+        snapshot = {}
+        if context_plan is not None:
+            if callable(getattr(context_plan, "metrics", None)):
+                snapshot = context_plan.metrics()
+            else:
+                snapshot = {
+                    "mode": getattr(context_plan, "mode", "shadow"),
+                    "used_tokens": int(getattr(context_plan, "used_tokens", 0) or 0),
+                    "omitted": len(getattr(context_plan, "omitted", ()) or ()),
+                    "warnings": list(getattr(context_plan, "warnings", ()) or ()),
+                }
+        changes = {"phase": phase, "context_snapshot": snapshot}
+        if error:
+            changes["last_error"] = {"message": str(error)[:200]}
+        return store.patch(latest.task_id, changes, expected_version=latest.state_version,
+                           reason="agent finished")
+    except Exception as exc:  # noqa: BLE001 - state shadow must not block serving
+        _slog("TASK_STATE", "finish failed: %s", exc)
+        return None
 
 
 def serve_config(cfg) -> dict[str, Any]:
@@ -149,25 +256,45 @@ def _build_range_gateway(cfg, index=None):
         return None
 
 
-def _build_backend(cfg) -> tuple[Callable, int, Any]:
+def _build_backend(cfg, rag_llm=None) -> tuple[Callable, int, Any]:
     """构造 (backend_factory[(builder, agent, reg)], n_brain, range_gateway)。
     backend_factory(messages, user_input, sink) 可被反复调用构建携带历史的 Runner。
     gateway 供 _run_agent 每请求 bind 当前会话（读侧）+ 注入折叠归档器（写侧）。
     """
     from agentlab.runtime.cli import _build_registry, _system_instruction, _build_runner
 
-    from agentlab.tools.rag_tools import build_vector_index
-    index = build_vector_index(cfg.rag, cfg.vault_root)
-    gateway = _build_range_gateway(cfg, index=index)
+    from agentlab.tools.rag_tools import build_p2_store, build_vector_index
+    # P2 is the user-facing Vault route when embedding is configured.  Keep
+    # the legacy index only when P2 is unavailable so the old path remains a
+    # rollback without doubling provider calls and SQLite scans in production.
+    # Build one provider for the process.  Reconstructing it for every SSE
+    # turn discarded the HTTP connection pool and reset circuit-breaker state.
+    shared_llm = rag_llm
+    if shared_llm is None:
+        try:
+            from agentlab.runtime.cli import _make_resilient
 
-    reg, n_brain = _build_registry(cfg, with_brain=True, index=index,
+            shared_llm = _make_resilient(cfg)
+        except SystemExit:
+            # LLM is optional for lexical-only and test deployments.
+            shared_llm = None
+        except Exception:
+            # LLM is optional for lexical-only and test deployments.
+            shared_llm = None
+
+    p2_store = build_p2_store(cfg.rag, cfg.vault_root)
+    index = None if p2_store is not None else build_vector_index(cfg.rag, cfg.vault_root)
+    gateway = _build_range_gateway(cfg, index=p2_store or index)
+
+    reg, n_brain = _build_registry(cfg, with_brain=True, rag_llm=shared_llm,
+                                   index=index, p2_store=p2_store,
                                    range_gateway=gateway)
 
     def build(sink) -> Any:
         # SSE 观察与 loop 内部一致：工具结果按 config.max_tool_result_chars 截断，
         # 避免此前硬编码 1000/4000 导致 6k 字转写只露开头 → agent 误判缺失反复重拉（卡顿根因）
         cap = RunConfig.from_config(cfg).max_tool_result_chars
-        runner = _build_runner(cfg, registry=reg)
+        runner = _build_runner(cfg, registry=reg, provider=shared_llm)
         runner.on(Ev.MESSAGE_END, lambda p: sink.text(p.content or ""))
         # F5-016/OPT-182：透传真实入参（ToolStart.arguments 本就有值），
         # 前端才能显示「正在咨询 @agentX：问题…」而不是空对象。
@@ -178,6 +305,15 @@ def _build_backend(cfg) -> tuple[Callable, int, Any]:
             lambda p: sink.tool_end(p.name, (p.result or "")[:cap]),
         )
         return runner
+
+    async def close() -> None:
+        closer = getattr(shared_llm, "aclose", None)
+        if closer is not None:
+            await closer()
+
+    # Keep the existing callable factory contract while exposing an explicit
+    # lifecycle hook to Serve.aclose; no second global registry is introduced.
+    build.close = close
 
     return build, n_brain, gateway
 
@@ -199,17 +335,39 @@ def _new_tracer(cfg):
         return None
 
 
+# OPT-219 视觉分析按需启用：bili_visual/bili_screenshot 含截帧+视觉模型逐格分析
+# （真机实测约 4 分钟 + 视觉模型费用），默认"生成笔记"走字幕/转写轻量路径即可。
+# 只有用户消息明确提出视觉意图时，这两个工具才进模型工具面。
+VISUAL_ONLY_TOOLS = frozenset({"bili_visual", "bili_screenshot"})
+VISUAL_INTENT_KEYWORDS = ("视觉", "画面", "截图", "看图", "图", "帧", "镜头",
+                          "多模态", "screenshot", "visual")
+
+
+def _visual_tool_filter(user_input: str):
+    """未提出视觉意图 → 返回隐藏视觉类工具的 filter；明确提出 → None（工具面原样）。"""
+    text = (user_input or "").lower()
+    if any(kw.lower() in text for kw in VISUAL_INTENT_KEYWORDS):
+        return None
+    return lambda t: getattr(t, "name", "") not in VISUAL_ONLY_TOOLS
+
+
 async def _run_agent(cfg, build_backend, hist: list[Message], user_input: str, sink: _Sink,
                      store=None, session_id: str | None = None,
                      signal: asyncio.Event | None = None,
                      project_id: str | None = None,
                      range_gateway=None, approvals: ApprovalManager | None = None,
-                     run_id: str = "", tool_filter=None) -> dict:
+                     run_id: str = "", tool_filter=None,
+                     evaluation_read_only: bool = False) -> dict:
     """跑一轮 agent。
 
     `tool_filter(tool) -> bool` 可选：默认 None = 不改变行为（生产链路原样）。
     质量评测用它把工具面收敛成只读（`permission == "read"`），从结构上保证
     评测过程不可能写用户 Vault——评测要能反复跑，不能有副作用。
+
+    ``evaluation_read_only`` is stricter than a tool filter: it also disables
+    automatic memory recall/deposit and TaskState writes.  Offline answer
+    samples must measure retrieval/generation, not create memory candidates or
+    checkpoints merely because a configured production runtime has them on.
     """
     from agentlab.core.agent import Agent
     from agentlab.core.context import Context
@@ -223,8 +381,11 @@ async def _run_agent(cfg, build_backend, hist: list[Message], user_input: str, s
     # 空结果/仓库不可用静默降级为占位文案（有工具≠会用，注入不能靠模型想起调工具）
     from agentlab.memory.recall import memory_block_for
 
-    memory_block = memory_block_for(
-        cfg, user_input, topk=int(getattr(cfg.limits, "memory_inject_topk", 5) or 0))
+    memory_block = ""
+    if not evaluation_read_only:
+        memory_block = memory_block_for(
+            cfg, user_input, topk=int(getattr(cfg.limits, "memory_inject_topk", 5) or 0),
+            project_id=project_id or "")
     base_instructions = _system_instruction(cfg, reg.all(), memory=memory_block)
     instructions = apply_project_context(base_instructions, cfg.vault_root, project_id)
     project_injected = instructions != base_instructions
@@ -256,8 +417,57 @@ async def _run_agent(cfg, build_backend, hist: list[Message], user_input: str, s
         return _serve_confirm(cfg, t, prompt)
     hooks = RunHooks(confirm=confirm)
     run_cfg = RunConfig.from_config(cfg)
+    # P0-08: build a deterministic bounded plan for complex requests, but keep
+    # the existing ReAct path authoritative. The plan is persisted in the run
+    # summary/checkpoint as auditable shadow data and is never treated as proof
+    # of completion until PlanExecutor supplies evidence.
+    try:
+        from agentlab.core.planning import PlanBuilder
+
+        plan = PlanBuilder().build(
+            user_input,
+            {"project_id": project_id or "", "session_id": session_id or ""},
+            [getattr(tool, "name", "") for tool in tools],
+            deadline_at=(time.monotonic() + run_cfg.timeout) if run_cfg.timeout else None,
+        )
+        run_cfg.plan = plan
+    except Exception as exc:  # noqa: BLE001 - shadow planning never blocks serving
+        run_cfg.plan = None
+        _slog("PLAN", "shadow unavailable: %s", exc)
+    # P1 ContextAssembler runs in shadow by default.  It produces an auditable
+    # four-zone plan on each provider turn while leaving the compatibility
+    # Context renderer and model-visible messages unchanged.
+    try:
+        from agentlab.core.context_assembler import ContextAssembler
+
+        context_cfg = getattr(cfg, "context", None)
+        assembler_mode = str(getattr(context_cfg, "assembler_mode", "shadow"))
+        if assembler_mode in {"shadow", "on"}:
+            run_cfg.context_assembler = ContextAssembler(
+                budget_tokens=run_cfg.context_budget,
+                reserve_output_tokens=int(getattr(
+                    context_cfg, "reserve_output_tokens", 16384
+                )),
+                zone_budgets={
+                    "dialogue_memory": int(getattr(
+                        context_cfg, "history_budget_tokens", 8000
+                    )) + int(getattr(context_cfg, "memory_budget_tokens", 1200)),
+                    "external": int(getattr(context_cfg, "rag_budget_tokens", 4000)),
+                },
+                mode=assembler_mode,
+            )
+    except Exception as exc:  # noqa: BLE001 - planner is an optional shadow aid
+        _slog("CONTEXT", "assembler unavailable: %s", exc)
     run_cfg.signal = signal  # SSE 断连 → _emit 置位此信号 → loop 中止，停止烧 token
-    run_cfg = _attach_depository(cfg, run_cfg)  # S6 记忆调度：brain 可用才启用异步沉淀
+    if not evaluation_read_only:
+        run_cfg = _attach_depository(
+            cfg, run_cfg, source_session=session_id or "", project_id=project_id or "",
+        )
+    # S0：所有检索工具读取同一请求级 scope；模型不能通过工具参数伪造项目/会话范围。
+    from agentlab.contracts import RetrievalScope, bind_retrieval_scope, reset_retrieval_scope
+    scope_token = bind_retrieval_scope(RetrievalScope(
+        project_id=project_id or "", session_id=session_id or "",
+    ))
     # L11/OPT-111：写侧注入折叠区段归档器；读侧 ContextVar 绑当前会话（rag session 路），
     # run 结束（含异常）reset，防并发请求串话。
     range_token = None
@@ -267,29 +477,91 @@ async def _run_agent(cfg, build_backend, hist: list[Message], user_input: str, s
             chunk_chars=getattr(cfg.rag, "range_chunk_chars", 2000),
             max_chunks=getattr(cfg.rag, "range_max_chunks", 200))
         range_token = range_gateway.bind(session_id)
+    if evaluation_read_only:
+        task_state, task_state_snapshot = None, None
+    else:
+        task_state, task_state_snapshot = _begin_task_state(
+            cfg, run_id or "", session_id=session_id or "", project_id=project_id or "",
+            goal=user_input,
+        )
+    memory_runtime_token = None
+    try:
+        from agentlab.tools.connectors.brain_tools import _add_brain_path
+        _add_brain_path()
+        import tools_memory
+        memory_runtime_token = tools_memory.bind_runtime_dependencies(
+            range_gateway=range_gateway,
+            task_state_store=task_state,
+            task_state_id=str(run_id or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - optional invalidation wiring
+        _slog("MEMORY", "runtime invalidation unavailable: %s", exc)
+    # Feed the same validated checkpoint into the shadow planner.  The planner
+    # only observes it by default; the compatibility prompt remains unchanged.
+    run_cfg.task_state = task_state_snapshot
+    run_cfg.task_state_store = task_state
+    run_cfg.task_state_id = str(run_id or "")
+    run_cfg.vault_root = str(getattr(cfg, "vault_root", "") or "")
     tracer = _new_tracer(cfg)  # #6/OPT-126：serve 侧 run 落 trace（失败 None 降级）
     if tracer is not None and callable(getattr(runner, "on", None)):
+        # P1-02：工具 start 记参数指纹（脱敏由 tracer 负责），end 记截断结果
+        runner.on(Ev.TOOL_START, lambda p: tracer.record_tool(
+            p.name, "start",
+            arguments_hash=hashlib.sha1((getattr(p, "arguments", "") or "").encode()
+                                        ).hexdigest()[:12]))
         runner.on(Ev.TOOL_END, lambda p: tracer.record_tool(
             p.name, "end", result=(p.result or "")[:1000]))
     run_summary: dict = {
         "stop_reason": "error", "tokens": 0, "run_id": run_id,
         "session_id": session_id or "", "project_id": project_id or "",
+        "model": getattr(getattr(cfg, "llm", None), "model", ""),
+        "plan": run_cfg.plan.to_dict() if getattr(run_cfg, "plan", None) is not None else None,
     }
+    t0 = time.monotonic()
     try:
         result = await runner.run(agent, user_input, ctx=ctx, hooks=hooks, cfg=run_cfg)
         if tracer is not None:
             result.trace_id = tracer.trace_id
+        trace_data = result.run_trace if isinstance(result.run_trace, dict) else {}
+        counters = trace_data.get("counters", {}) if isinstance(trace_data, dict) else {}
         run_summary.update(stop_reason=result.stop_reason,
                            tokens=result.usage.total(),
-                           steps=len(result.messages))
+                           steps=int(counters.get("rounds", 0) or 0),
+                           rounds=int(counters.get("rounds", 0) or 0),
+                           llm_calls=int(counters.get("llm_calls", 0) or 0),
+                           tool_calls=int(counters.get("tool_calls", 0) or 0),
+                           retries=int(counters.get("retries", 0) or 0),
+                           plan_steps=int(counters.get("plan_steps", 0) or 0))
+        if isinstance(trace_data, dict) and isinstance(trace_data.get("context_assembler"), dict):
+            run_summary["context_assembler"] = dict(trace_data["context_assembler"])
     except Exception as exc:
         run_summary["error"] = f"{type(exc).__name__}: {exc}"
+        run_summary["error_code"] = getattr(exc, "code", "") or type(exc).__name__
+        _finish_task_state(
+            task_state, task_state_snapshot,
+            stop_reason="error", error=run_summary["error"],
+            context_plan=getattr(run_cfg, "context_plan", None),
+        )
         raise
     finally:
+        if task_state is not None and task_state_snapshot is not None and "error" not in run_summary:
+            _finish_task_state(
+                task_state, task_state_snapshot,
+                stop_reason=str(run_summary.get("stop_reason", "")),
+                context_plan=getattr(run_cfg, "context_plan", None),
+            )
+        reset_retrieval_scope(scope_token)
         if range_token is not None:
             range_gateway.reset(range_token)
+        if memory_runtime_token is not None:
+            try:
+                import tools_memory
+                tools_memory.reset_runtime_dependencies(memory_runtime_token)
+            except Exception as exc:  # noqa: BLE001
+                _slog("MEMORY", "runtime invalidation reset failed: %s", exc)
         if tracer is not None:
             with contextlib.suppress(Exception):
+                run_summary["duration_ms"] = int((time.monotonic() - t0) * 1000)
                 tracer.record_run(input=user_input[:300], **run_summary)
     # 会话持久化：把本轮新增消息（跳过 system 与已重放的历史）追加进会话存储
     if store is not None and session_id:
@@ -315,6 +587,8 @@ async def _run_agent(cfg, build_backend, hist: list[Message], user_input: str, s
         "stop_reason": result.stop_reason,
         "tokens": result.usage.total(),
         "trace_id": result.trace_id,
+        "answer_gate": result.answer_gate,
+        "plan": run_cfg.plan.to_dict() if getattr(run_cfg, "plan", None) is not None else None,
         "project_id": project_id or "",
         "project_context_injected": project_injected,
         "history": [
@@ -457,6 +731,11 @@ class _ServeApp:
         app.router.add_get("/v1/runs", self.on_runs)
         app.router.add_get("/v1/runs/{trace_id}", self.on_run_detail)
         app.router.add_get("/v1/agents", self.on_agents)
+        app.router.add_get("/v1/tasks/{task_id}/operations", self.on_task_operations)
+        app.router.add_post(
+            "/v1/tasks/{task_id}/operations/{operation_id}/reconcile",
+            self.on_reconcile_operation,
+        )
         app.router.add_delete("/v1/sessions/{session_id}", self.on_delete_session)
         # CORS 预检兜底（F5-021 回归修复）：带 Authorization 的跨域请求会先发 OPTIONS，
         # 此前只有 /v1/responses 与 /v1/approvals 注册了 OPTIONS，`/v1/runs`、`/v1/agents`
@@ -598,6 +877,111 @@ class _ServeApp:
                 status=404, request_id=request.get("request_id"))
         return web.json_response({"ok": True, "detail": detail})
 
+    @staticmethod
+    def _task_path_value(request, name: str, max_length: int) -> str | None:
+        value = str(request.match_info.get(name, "") or "").strip()
+        if not value or len(value) > max_length or "/" in value or "\\" in value:
+            return None
+        return value
+
+    @staticmethod
+    def _task_state_error_response(
+        request, message: str, *, status: int = 400
+    ) -> web.Response:
+        return make_json_response(
+            StandardResponse.error(ErrorCode(status), message, request.get("request_id")),
+            status=status,
+            request_id=request.get("request_id"),
+        )
+
+    async def on_task_operations(self, request) -> web.Response:
+        """列出恢复所需的 pending/unknown 操作；不返回参数正文，也不执行工具。"""
+        serve = self._serve
+        auth_resp = self._authorize(request, serve.serve_cfg)
+        if auth_resp is not None:
+            return auth_resp
+        task_id = self._task_path_value(request, "task_id", 128)
+        if task_id is None:
+            return self._task_state_error_response(request, "invalid task id")
+        store = _task_state_store(serve.cfg)
+        if store is None:
+            return self._task_state_error_response(
+                request, "task state store unavailable", status=503)
+        state = store.get(task_id)
+        if state is None:
+            return self._task_state_error_response(request, "task not found", status=404)
+        return web.json_response({
+            "ok": True,
+            "task_id": state.task_id,
+            "state_version": state.state_version,
+            "phase": state.phase,
+            "operations": store.pending_operations(task_id),
+        })
+
+    async def on_reconcile_operation(self, request) -> web.Response:
+        """用外部证据结算一个 ``unknown`` 操作；此接口绝不重放工具。"""
+        serve = self._serve
+        auth_resp = self._authorize(request, serve.serve_cfg)
+        if auth_resp is not None:
+            return auth_resp
+        task_id = self._task_path_value(request, "task_id", 128)
+        operation_id = self._task_path_value(request, "operation_id", 256)
+        if task_id is None or operation_id is None:
+            return self._task_state_error_response(request, "invalid task or operation id")
+        store = _task_state_store(serve.cfg)
+        if store is None:
+            return self._task_state_error_response(
+                request, "task state store unavailable", status=503)
+        state = store.get(task_id)
+        if state is None:
+            return self._task_state_error_response(request, "task not found", status=404)
+        operation = next(
+            (row for row in state.pending_tools if row.get("operation_id") == operation_id),
+            None,
+        )
+        if operation is None:
+            return self._task_state_error_response(request, "operation not found", status=404)
+        if operation.get("status") != "unknown":
+            return self._task_state_error_response(
+                request, "only unknown operations can be reconciled", status=409)
+        try:
+            body = await request.json()
+        except Exception:
+            return self._task_state_error_response(request, "invalid json")
+        if not isinstance(body, dict):
+            return self._task_state_error_response(request, "external result must be an object")
+        external_result = dict(body)
+        expected_version = external_result.pop("expected_version", None)
+        if expected_version is not None:
+            if isinstance(expected_version, bool) or not isinstance(expected_version, int) \
+                    or expected_version < 0:
+                return self._task_state_error_response(request, "expected_version must be a non-negative integer")
+        try:
+            saved = store.reconcile_operation(
+                task_id,
+                operation_id,
+                external_result=external_result,
+                expected_version=expected_version,
+            )
+        except Exception as exc:
+            from agentlab.runtime.task_state import TaskStateConflict, TaskStateError
+
+            if isinstance(exc, TaskStateConflict):
+                return self._task_state_error_response(request, str(exc), status=409)
+            if isinstance(exc, TaskStateError):
+                return self._task_state_error_response(request, str(exc), status=400)
+            raise
+        reconciled = next(
+            row for row in saved.pending_tools if row.get("operation_id") == operation_id
+        )
+        _slog("TASK_RECONCILE", task_id, operation_id, reconciled.get("status"))
+        return web.json_response({
+            "ok": True,
+            "task_id": saved.task_id,
+            "state_version": saved.state_version,
+            "operation": reconciled,
+        })
+
     async def on_approval(self, request):
         """HITL resolve：allow/deny/cancel 均是幂等终态写入。"""
         serve = self._serve
@@ -730,6 +1114,7 @@ class _ServeApp:
                                            project_id=req.project_id,
                                            range_gateway=getattr(serve, "range_gateway", None),
                                            approvals=serve.approvals,
+                                           tool_filter=_visual_tool_filter(latest),
                                            run_id=req.request_id or request.get("request_id", ""))
             await queue.put(None)
             await write_task
@@ -894,7 +1279,8 @@ class Serve:
                  build_factory: Callable | None = None,
                  session_store=None,
                  multi_providers: dict | None = None,
-                 synth_provider=None):
+                 synth_provider=None,
+                 idem_store_path: str | None = None):
         from agentlab import __version__
         self.cfg = cfg
         self.port = port or 8643
@@ -903,6 +1289,7 @@ class Serve:
         self._httpd = None
         # 测试注入点：替代真实 brain/LLM 后端的 Runner 构建器
         self._build_factory = build_factory
+        self.build_backend = None
         # 会话存储注入点：测试传 InMemory/temp-dir；None 时 start 自动建 JSONL
         self._session_store = session_store
         # P2-2：multi-agent 答者注册表与汇总模型（None 时 build() 按配置装配；测试可直接注入）
@@ -911,8 +1298,12 @@ class Serve:
         self.multi_registry: dict = {}
         self.synth_provider = None
         self.range_gateway = None  # L11：build() 时装配（_build_backend 返回三元组）
-        # 契约层幂等（§4.7）：request_id 重复提交重放首次结果（有界 TTL）
-        self.idem = _IdempotencyCache()
+        # 契约层幂等（§4.7）：request_id 重复提交重放首次结果（有界 TTL）；
+        # P0-04：默认挂 SQLite 背板（与默认 state.db 同目录），重启后已完成
+        # 请求仍可重放，不重复执行。测试传 idem_store_path 指临时文件。
+        if idem_store_path is None:
+            idem_store_path = str(Path(__file__).resolve().parent / "idempotency.db")
+        self.idem = _IdempotencyCache(store_path=idem_store_path)
         self.approvals = ApprovalManager()
 
     def build(self):
@@ -997,6 +1388,12 @@ class Serve:
             except Exception:  # noqa: BLE001 —— 收尾失败不阻断退出
                 _slog("ACLOSE_FAIL", getattr(provider, "name", "?"))
         self.multi_registry = {}
+        closer = getattr(getattr(self, "build_backend", None), "close", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 - cleanup must not mask shutdown
+                _slog("LLM_ACLOSE_FAIL")
 
 
 def main(argv: list[str] | None = None) -> int:

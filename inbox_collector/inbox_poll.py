@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from typing import Callable
 
 from queue_store import InboxQueueStore
 
@@ -234,8 +235,24 @@ def open_queue_store(config: dict, queue_path: str, seen_path: str) -> InboxQueu
 
 # ========== 主流程 ==========
 
-def poll(config: dict, dry_run: bool = False) -> int:
-    """执行一轮采集，返回新入队任务数"""
+def poll(config: dict, dry_run: bool = False, operation_id: str = "",
+         stage_callback: Callable[[str], None] | None = None) -> int:
+    """执行一轮采集，返回新入队任务数。
+
+    ``operation_id`` is supplied by the Runner through a request-local
+    context.  The queue ledger is written before mail I/O and completed only
+    after the durable queue/seen transaction has settled, so a crash leaves a
+    queryable ``running`` record instead of an unverifiable count guess.
+    """
+    def emit(stage_id: str) -> None:
+        if stage_callback is None:
+            return
+        try:
+            stage_callback(stage_id)
+        except Exception:
+            # Stage telemetry must never alter mail collection or its ledger.
+            return
+
     queue_path = config.get("queue_path", "inbox/queue.jsonl")
     seen_path = config.get("seen_path", "inbox/seen.txt")
     max_fetch = int(config.get("max_fetch", 20))
@@ -249,12 +266,30 @@ def poll(config: dict, dry_run: bool = False) -> int:
 
     store = open_queue_store(config, queue_path, seen_path)
     store.migrate_legacy()
+    operation_id = str(operation_id or "").strip()[:256]
+    ledger_started = bool(operation_id and not dry_run)
+    if ledger_started:
+        created = store.begin_collection(operation_id, before_hash=store.snapshot_hash())
+        if not created:
+            previous = store.collection_operation(operation_id) or {}
+            if previous.get("status") == "succeeded":
+                return int(previous.get("new_tasks") or 0)
+            raise RuntimeError(
+                "COLLECTOR_OPERATION_UNKNOWN operation already exists; "
+                "query inbox_operation before retrying"
+            )
     seen = store.seen_markers()
     new_tasks = 0
     dup_count = 0
 
-    messages = list_messages(max_fetch)
+    try:
+        messages = list_messages(max_fetch)
+    except Exception as exc:
+        if ledger_started:
+            store.fail_collection(operation_id, error_code=type(exc).__name__)
+        raise
     print_status("COLLECTOR", f"拉取 {len(messages)} 封邮件")
+    emit("fetched")
 
     processed_ids: list[str] = []
     for msg in messages:
@@ -303,9 +338,13 @@ def poll(config: dict, dry_run: bool = False) -> int:
                 "source": "agent_mail",
                 "error": None,
             }
+            if operation_id:
+                task["operation_id"] = operation_id
             print_status("COLLECTOR", f"新增任务 {content_type} {norm_url}")
             if not dry_run:
-                inserted = store.enqueue(task, dedupe_key=fp, markers=[fp, msg_id])
+                inserted = store.enqueue(
+                    task, dedupe_key=fp, markers=[fp, msg_id], operation_id=operation_id
+                )
                 if inserted:
                     new_tasks += 1
                 else:
@@ -323,6 +362,12 @@ def poll(config: dict, dry_run: bool = False) -> int:
             seen.add(msg_id)
 
     print_status("COLLECTOR", f"新增 {new_tasks} 条任务，去重跳过 {dup_count}")
+    emit("parsed")
+    if ledger_started:
+        store.complete_collection(
+            operation_id, after_hash=store.snapshot_hash(), new_tasks=new_tasks
+        )
+    emit("completed")
     return new_tasks
 
 

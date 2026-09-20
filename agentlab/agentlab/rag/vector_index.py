@@ -32,6 +32,8 @@ except Exception:  # pragma: no cover - 未安装时走纯 Python
     _sqlite_vec = None
 
 _EXCLUDE_DIRS = {".obsidian", ".agent-brain", ".trash", ".tmp", "node_modules"}
+# A2/OPT-227：记忆归档区默认不入向量索引（与 brain common.MEMORY_ARCHIVE_REL 口径一致）
+_MEMORY_ARCHIVE_REL = "ark/memory/archive/"
 
 
 def chunk_text(text: str, max_chars: int = 600) -> list[str]:
@@ -257,6 +259,8 @@ class VectorIndex:
         entries: dict[str, float] = {}
         for p in vault_root.rglob("*.md"):
             if any(part in _EXCLUDE_DIRS for part in p.parts):
+                continue
+            if p.relative_to(vault_root).as_posix().startswith(_MEMORY_ARCHIVE_REL):
                 continue
             try:
                 entries[p.relative_to(vault_root).as_posix()] = p.stat().st_mtime

@@ -15,3 +15,9 @@ from agentlab.eval.behavior import (  # noqa: F401
     load_behavior_scenarios,
     run_behavior_baseline,
 )
+
+
+def run_memory_eval(*args, **kwargs):
+    """Lazy export to keep ``python -m agentlab.eval.memory_governance`` clean."""
+    from agentlab.eval.memory_governance import run_memory_eval as _run
+    return _run(*args, **kwargs)

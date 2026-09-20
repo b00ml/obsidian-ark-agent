@@ -704,6 +704,10 @@ a.search-row-title { text-decoration: none; display: block; }
 .sos-settings-section { margin: 14px 0 6px; color: var(--space-cyan); font-size: 13px; letter-spacing: 1px; border-left: 3px solid var(--space-cyan); padding-left: 8px; }
 .sos-settings-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .sos-hint { color: var(--space-dim); font-size: 12px; margin: 6px 0 10px; }
+.sos-rag-diagnostics { border: 1px solid var(--space-border); border-radius: var(--space-radius-sm); padding: 8px 10px; margin: 0 0 10px; background: var(--space-card); }
+.sos-rag-diagnostics-title { color: var(--space-text); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.sos-rag-diagnostics-line { color: var(--space-dim); font-size: 11px; line-height: 1.5; }
+.sos-rag-diagnostics-warning { color: var(--space-warn, #e0a458); font-size: 11px; line-height: 1.5; }
 .sos-bl-row, .sos-mail-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .sos-bl-list .sos-bl-row input[type="text"], .sos-bl-list .sos-bl-row input[type="number"] { background: var(--space-card); color: var(--space-text); border: 1px solid var(--space-border); border-radius: var(--space-radius-sm); padding: 5px 8px; flex: 1; }
 .sos-cat-list .sos-bl-row input[type="text"] { background: var(--space-card); color: var(--space-text); border: 1px solid var(--space-border); border-radius: var(--space-radius-sm); padding: 5px 8px; flex: 1; }
@@ -833,6 +837,15 @@ a.search-row-title { text-decoration: none; display: block; }
 .agent-wb-btn.danger { color: var(--text-error); }
 .agent-wb-muted { opacity: 0.75; margin-bottom: 6px; font-size: 0.9em; }
 .agent-wb-link { cursor: pointer; text-decoration: underline; margin-bottom: 4px; }
+.agent-wb-artifacts { display: grid; gap: 6px; margin-bottom: 10px; }
+.agent-wb-artifact { border: 1px solid var(--background-modifier-border); border-radius: 6px; padding: 7px 8px; background: var(--background-primary); }
+.agent-wb-artifact.missing { border-color: var(--text-error, #e06c75); }
+.agent-wb-artifact-head { display: flex; justify-content: space-between; gap: 8px; font-size: 0.78em; opacity: 0.75; }
+.agent-wb-artifact-status { color: var(--text-success, #98c379); }
+.agent-wb-artifact-version { margin-left: auto; color: var(--text-accent); }
+.agent-wb-artifact.missing .agent-wb-artifact-status { color: var(--text-error, #e06c75); }
+.agent-wb-artifact .agent-wb-link { overflow-wrap: anywhere; margin: 3px 0 0; font-size: 0.86em; }
+.agent-wb-artifact-sources { font-size: 0.72em; opacity: 0.6; }
 .agent-wb-flow {
   grid-column: 2;
   grid-row: 1;

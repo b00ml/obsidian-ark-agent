@@ -62,6 +62,18 @@ class RouteLLM(LLMProvider):
         self.default_tier = default_tier if default_tier in providers else next(iter(providers))
         self.classify = classify
 
+    async def aclose(self) -> None:
+        """Close each unique routed provider without double-closing aliases."""
+        seen: set[int] = set()
+        for provider in self.providers.values():
+            marker = id(provider)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            closer = getattr(provider, "aclose", None)
+            if closer is not None:
+                await closer()
+
     def resolve(self, tier: str | None, messages: list[Message]) -> LLMProvider:
         t = tier or (self.classify(messages) if self.classify else self.default_tier)
         return route(self.providers, t, self.default_tier)

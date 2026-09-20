@@ -55,6 +55,10 @@ def _decay_factor(created_at: str, now: datetime.datetime, half_life_days: float
         created = datetime.datetime.fromisoformat(str(created_at))
     except ValueError:
         return 1.0
+    # OPT-223：MemoryMarkdownStore 的时间戳带 UTC 时区（aware），而 now 为本地
+    # naive——直接相减抛 TypeError（不被 except ValueError 捕获）。统一转本地 naive。
+    if created.tzinfo is not None:
+        created = created.astimezone().replace(tzinfo=None)
     age_days = max((now - created).total_seconds(), 0.0) / 86400.0
     return 0.5 ** (age_days / half_life_days)
 
@@ -63,11 +67,13 @@ class MemoryStore:
     def __init__(self, brain_config: dict | None = None,
                  per_item_chars: int = CAPTURE_ITEM_CHARS,
                  decay_half_life_days: float = DEFAULT_DECAY_HALF_LIFE_DAYS,
-                 now_fn: Callable[[], datetime.datetime] | None = None):
+                 now_fn: Callable[[], datetime.datetime] | None = None,
+                 source_session: str = ""):
         self._brain_config = brain_config or {}
         self._per_item_chars = per_item_chars
         self._decay_half_life_days = float(decay_half_life_days)
         self._now_fn = now_fn or datetime.datetime.now  # 可注入时钟，便于单测
+        self._source_session = source_session  # OPT-224：serve 会话追溯锚（commit 未显式给时兜底）
         _add_brain_path()  # 幂等：确保 brain 平铺模块可 flat import
         self._tm = self._import("tools_memory")
         self._tv = self._import("tools_vault")
@@ -84,13 +90,21 @@ class MemoryStore:
         return self._tm is not None
 
     def commit(self, content: str, tags: list[str] | None = None,
-               source_session: str = "", dedup: bool = False) -> dict:
+               source_session: str = "", dedup: bool = False,
+               importance: int | None = None, mem_type: str = "context",
+               bucket: bool = False, confidence=None, status: str | None = None,
+               source: str = "user", source_ref: str = "", scope=None,
+               session_id: str = "", valid_until: str | None = None,
+               review_due_at: str | None = None, correction_of: str | None = None,
+               candidate_first: bool = False,
+               explicit_confirmation: bool = False) -> dict:
         """沉淀一条可复用记忆（content + tags）。
 
         dedup=True 时先查已有记忆做相似度去重，高度重复则返回
         `{"status":"skipped_duplicate","similar":...}`，避免重复沉淀。
         默认 False 以保持 API 语义不变，由捕获流程显式开启。
         写入前经 `govern_capture` 治理（OPT-090：Tier-1 单条截断），身份锚不丢。
+        OPT-224：importance 透传 LLM 提取打分；source_session 未显式给时用构造期锚。
         """
         if self._tm is None:
             return {"status": "unavailable"}
@@ -100,7 +114,21 @@ class MemoryStore:
             if dup is not None:
                 return {"status": "skipped_duplicate", "similar": dup}
         try:
-            return self._tm.memory_commit(self._brain_config, content, tags, source_session)
+            kwargs = {
+                "importance": importance, "mem_type": mem_type, "bucket": bucket,
+                "confidence": confidence, "status": status, "source": source,
+                "source_ref": source_ref, "scope": scope, "session_id": session_id,
+                "valid_until": valid_until, "review_due_at": review_due_at,
+                "correction_of": correction_of, "candidate_first": candidate_first,
+                "explicit_confirmation": explicit_confirmation,
+            }
+            import inspect
+            fn = self._tm.memory_commit
+            params = inspect.signature(fn).parameters
+            if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                kwargs = {k: v for k, v in kwargs.items() if k in params}
+            return fn(self._brain_config, content, tags,
+                      source_session or self._source_session, **kwargs)
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -122,7 +150,11 @@ class MemoryStore:
                 best_overlap, best = o, c
         return best if best_overlap >= _DUP_THRESHOLD else None
 
-    def query(self, topic: str, limit: int = 10, *, apply_decay: bool = True) -> dict:
+    def query(self, topic: str, limit: int = 10, *, apply_decay: bool = True,
+              project_id: str | None = None, session_id: str | None = None,
+              statuses: list[str] | None = None,
+              include_archive: bool = False,
+              min_confidence: float | None = None) -> dict:
         """按 topic 召回记忆。
 
         apply_decay（默认开）且半衰期 > 0 时：超取 3 倍候选，按
@@ -134,7 +166,22 @@ class MemoryStore:
         decay_on = apply_decay and self._decay_half_life_days > 0
         fetch = limit * 3 if decay_on else limit
         try:
-            q = self._tm.memory_query(self._brain_config, topic, fetch)
+            query_config = dict(self._brain_config)
+            if project_id:
+                query_config["project_id"] = project_id
+            if session_id:
+                query_config["session_id"] = session_id
+            fn = self._tm.memory_query
+            query_kwargs = {
+                "session_id": session_id, "statuses": statuses,
+                "include_archive": include_archive,
+                "min_confidence": min_confidence,
+            }
+            import inspect
+            params = inspect.signature(fn).parameters
+            if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                query_kwargs = {k: v for k, v in query_kwargs.items() if k in params}
+            q = fn(query_config, topic, fetch, **query_kwargs)
         except Exception as e:
             return {"status": "error", "error": str(e), "total": 0, "results": []}
         results = q.get("results") if isinstance(q, dict) else (getattr(q, "results", None) or [])
@@ -150,8 +197,11 @@ class MemoryStore:
 
             results = [r for _, r in sorted(enumerate(results), key=_score, reverse=True)]
         results = results[:limit]
-        return {"topic": q.get("topic", topic) if isinstance(q, dict) else topic,
-                "total": len(results), "results": results}
+        payload = {"topic": q.get("topic", topic) if isinstance(q, dict) else topic,
+                   "total": len(results), "results": results}
+        if isinstance(q, dict) and q.get("filtered_reasons"):
+            payload["filtered_reasons"] = q["filtered_reasons"]
+        return payload
 
     def search(self, keyword: str, limit: int = 20) -> dict:
         """全库语义召回（vault_search）。"""

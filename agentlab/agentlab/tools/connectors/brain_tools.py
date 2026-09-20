@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from agentlab.core.errors import AgentError
-from agentlab.tools.base import ExecutionMode, Tool, tool
+from agentlab.tools.base import ExecutionMode, Tool, tool, validate_contract
 
 # brain 目录与 agentlab 项目根同父：<obsidian_agent>/obsidian_agent_brain
 BRAIN_PKG_DIR = Path(__file__).resolve().parents[4] / "obsidian_agent_brain"
@@ -87,24 +87,49 @@ def _wrap(fn, config: dict, permission: str):
 # 不加缓存时 agent 因结果被截断/重试会反复拉取，每次重跑 Whisper（卡顿根因之一）。
 _TRANSCRIPT_CACHE: dict[str, dict] = {}
 
+# 视觉分析结果缓存（按 bvid，OPT-218）：bili_visual 含下载/截帧/网格图/视觉模型
+# 逐格分析，实测约 4 分钟；serve 断连重试后同 bvid 重跑 = 全部重做。与转写缓存
+# 同语义（进程内、重启即失效、重新分析需重启 serve）。
+_VISUAL_CACHE: dict[str, dict] = {}
 
-def _with_transcribe_cache(fn):
-    """把 bili_transcribe 包装成"同 bvid 命中缓存即返回"的版本（_TRANSCRIPT_CACHE）。
+# 文章总结缓存（按 url，OPT-222）：article_summarize 抓取+LLM 总结约 1-2 分钟，
+# "处理收件箱"重发循环中同 URL 重复渲染烧钱；同语义（进程内）。
+_ARTICLE_CACHE: dict[str, dict] = {}
 
+
+def _with_key_cache(fn, cache: dict, key_param: str = "bvid"):
+    """把 (config, <key_param>, ...) 形态的工具包装成"同 key 命中缓存即返回"。
+
+    registry 以 kwargs 调度工具，key 参数名必须与原函数签名一致（bili 系=bvid、
+    article=url），否则 key 恒为空导致所有调用撞同一个缓存槽。
     关键：须保留原函数签名——若包装函数自带 **kw 收集，_wrap 的 inspect.signature
-    会把 VAR_KEYWORD 名 `kw` 当作工具参数写入 schema，导致 registry 调度 bili_transcribe
-    时报 "unexpected keyword argument 'kw'"（转写直接失败，写笔记流程被阻断）。
+    会把 VAR_KEYWORD 名 `kw` 当作工具参数写入 schema，导致 registry 调度时报
+    "unexpected keyword argument 'kw'"（转写直接失败，写笔记流程被阻断）。
     """
-    def cached(config, bvid=None, **kw):
-        key = str(bvid or "")
-        hit = _TRANSCRIPT_CACHE.get(key)
-        if hit is not None:
-            return {"cached": True, **hit}
-        out = fn(config, bvid, **kw)
-        _TRANSCRIPT_CACHE[key] = out
-        return out
+    if key_param == "url":
+        def cached(config, url=None, **kw):
+            key = str(url or "")
+            hit = cache.get(key)
+            if hit is not None:
+                return {"cached": True, **hit}
+            out = fn(config, url, **kw)
+            cache[key] = out
+            return out
+    else:
+        def cached(config, bvid=None, **kw):
+            key = str(bvid or "")
+            hit = cache.get(key)
+            if hit is not None:
+                return {"cached": True, **hit}
+            out = fn(config, bvid, **kw)
+            cache[key] = out
+            return out
     cached.__signature__ = inspect.signature(fn)  # 签名对齐原函数，rw 不泄漏 kw
     return cached
+
+
+def _with_transcribe_cache(fn):
+    return _with_key_cache(fn, _TRANSCRIPT_CACHE, "bvid")
 
 
 def build_brain_tools(vault_root: str, config: dict, eager: bool = False) -> list[Tool]:
@@ -119,6 +144,17 @@ def build_brain_tools(vault_root: str, config: dict, eager: bool = False) -> lis
     # vault_root 注入：允许测试指向临时 Vault
     if vault_root:
         brain_cfg["vault_path"] = str(vault_root)
+    # Propagate non-secret memory governance into direct brain tools.  The
+    # request scope itself is read from ContextVar by tools_memory, so a model
+    # cannot widen project/session visibility through tool arguments.
+    memory_cfg = (config.get("memory") if isinstance(config, dict)
+                  else getattr(config, "memory", None))
+    if memory_cfg is not None:
+        try:
+            brain_cfg["memory_policy"] = memory_cfg.model_dump()
+        except AttributeError:
+            if isinstance(memory_cfg, dict):
+                brain_cfg["memory_policy"] = dict(memory_cfg)
 
     # 1) 导入工具注册表
     _add_brain_path()
@@ -134,17 +170,34 @@ def build_brain_tools(vault_root: str, config: dict, eager: bool = False) -> lis
                      "tools_bili", "tools_article", "tools_inbox"):
         mods[mod_name] = importlib.import_module(mod_name)
 
-    # 3) 按 spec 组装 Tool（5-tuple: name, module_suffix, desc, permission, timeout）
+    # 3) 按 spec 组装 Tool（BrainToolSpec: name/module/desc/permission/timeout
+    #    + side_effects/idempotent 契约字段）
     tools: list[Tool] = []
-    for name, module_suffix, description, permission, timeout in BRAIN_TOOL_SPECS:
+    for spec in BRAIN_TOOL_SPECS:
+        name, module_suffix = spec.name, spec.module_suffix
+        description, permission, timeout = spec.description, spec.permission, spec.timeout
         mod_name = f"tools_{module_suffix}"
         if mod_name not in mods or not hasattr(mods[mod_name], name):
-            continue  # 该函数不存在：如 bili_job_status（设计预留、代码未实现），自动跳过
+            continue  # 该函数不存在：预留 spec（代码未实现），自动跳过
         fn = getattr(mods[mod_name], name)
 
         if name == "bili_transcribe":
             # 转写缓存：同 bvid 重复调用直接返回，避免重跑 Whisper（约数分钟/次）
             fn = _with_transcribe_cache(fn)
+            fn.__name__ = name
+            fn.__doc__ = description
+
+        if name == "bili_visual":
+            # 视觉缓存（OPT-218）：截帧+视觉模型实测约 4 分钟，断连重试/重复调用
+            # 同 bvid 直接复用，不再全量重做
+            fn = _with_key_cache(fn, _VISUAL_CACHE, "bvid")
+            fn.__name__ = name
+            fn.__doc__ = description
+
+        if name == "article_summarize":
+            # 文章总结缓存（OPT-222）：抓取+LLM 总结约 1-2 分钟；真机"处理收件箱"
+            # 重发循环中同 URL 重复渲染烧钱。key=url，与 bvid 缓存同语义（进程内）。
+            fn = _with_key_cache(fn, _ARTICLE_CACHE, "url")
             fn.__name__ = name
             fn.__doc__ = description
 
@@ -159,6 +212,13 @@ def build_brain_tools(vault_root: str, config: dict, eager: bool = False) -> lis
                 execution_mode="parallel",
                 can_terminate=False,
                 execution_timeout=timeout or 90.0,  # None → 90s 兜底
+                side_effects=spec.side_effects or None,
+                idempotent=spec.idempotent,
             )(wrapped)
         )
+
+    # 契约门禁：write/danger 工具缺 side_effects/idempotent 视为装配失败（fail-closed）
+    errors = validate_contract(tools)
+    if errors:
+        raise AgentError("AGENT_TOOL_CONTRACT", "brain 工具契约不完整: " + "; ".join(errors))
     return tools

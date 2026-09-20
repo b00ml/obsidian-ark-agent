@@ -8,7 +8,7 @@
   - build_note:     渲染 Obsidian 笔记（YAML frontmatter + 结构化正文）
 
 用法:
-  python article_summarizer.py <url> [--vault C:/path/to/your/obsidian-vault] [--output 自定义路径]
+  python article_summarizer.py <url> [--vault E:/peik1_books] [--output 自定义路径]
 
 关键约束（见 DESIGN-INGEST-PIPELINE.md §3.8 / 禁止事项 2）:
   - Prompt 必须走 bili_summarizer/prompts/article-summary-user.st + prompt_loader
@@ -28,6 +28,7 @@ import requests
 from prompt_loader import load_prompt, render
 from visual_analyzer import load_visual_config
 from knowledge_compiler import compile_note
+from provider_client import ProviderError, TextModelClient
 
 # 配置文件默认路径（相对本文件）
 DEFAULT_CONFIG_PATH = os.path.join(
@@ -103,8 +104,10 @@ def extract_article(html_text: str) -> dict:
     if m:
         title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
     if not title:
-        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
-                      html_text, re.IGNORECASE)
+        m = re.search(
+            r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+            html_text, re.IGNORECASE,
+        )
         if m:
             title = m.group(1).strip()
     if not title:
@@ -124,8 +127,11 @@ def extract_article(html_text: str) -> dict:
         if m:
             author = re.sub(r"<[^>]+>", "", m.group(1)).strip()
     if not author:
-        m = re.search(r'<meta[^>]+property=["\']og:article:author["\'][^>]*content=["\']([^"\']+)["\']',
-                      html_text, re.IGNORECASE)
+        m = re.search(
+            r'<meta[^>]+property=["\']og:article:author["\']'
+            r'[^>]*content=["\']([^"\']+)["\']',
+            html_text, re.IGNORECASE,
+        )
         if m:
             author = m.group(1).strip()
 
@@ -167,35 +173,23 @@ def summarize_article(article: dict, url: str, config: dict) -> dict:
     )
 
     # trace 记录（trace_id / cost / latency）
-    trace_id = f"trace_{int(time.time() * 1000)}"
     start = time.time()
 
-    if not model_cfg.get("api_key") or model_cfg["api_key"].startswith("sk-xxx"):
-        raise RuntimeError(
-            f"未配置有效的 API Key (model={model_cfg.get('model')})。\n"
-            f"请编辑 {DEFAULT_CONFIG_PATH} 填写 api_key。"
-        )
-
-    resp = requests.post(
-        f"{model_cfg['api_base'].rstrip('/')}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {model_cfg['api_key']}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model_cfg["model"],
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1500,
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    result = resp.json()
-    content = result["choices"][0]["message"]["content"]
+    try:
+        result = TextModelClient(
+            api_base=model_cfg.get("api_base", ""), api_key=model_cfg.get("api_key", ""),
+            model=model_cfg.get("model", ""), timeout=120, transport=requests.post,
+        ).chat(prompt, max_tokens=1500)
+    except ProviderError as exc:
+        raise RuntimeError(str(exc)) from exc
+    content = result.content
 
     # trace 打印（CLI 工具：打印 [ARTICLE] 状态即可，见 llm_calls.md）
+    # Use the client trace id as the source of truth; the old local id could
+    # diverge from the provider trace printed by the shared adapter.
+    trace_id = result.trace_id
     latency = time.time() - start
-    usage = result.get("usage", {})
+    usage = result.usage
     cost = (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)) / 1000000
     print(f"[ARTICLE] LLM 调用完成 trace_id={trace_id} latency={latency:.1f}s "
           f"tokens={usage.get('total_tokens', 0)} est_cost=${cost:.4f}")
@@ -289,21 +283,13 @@ def make_llm_call(model_cfg: dict):
     复用 summarize_article 同款请求构造（config/visual_models.json 的 default 模型）。
     """
     def llm_call(prompt: str) -> str:
-        resp = requests.post(
-            f"{model_cfg['api_base'].rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {model_cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_cfg["model"],
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 800,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        try:
+            return TextModelClient(
+                api_base=model_cfg.get("api_base", ""), api_key=model_cfg.get("api_key", ""),
+                model=model_cfg.get("model", ""), timeout=60, transport=requests.post,
+            ).chat(prompt, max_tokens=800).content
+        except ProviderError as exc:
+            raise RuntimeError(str(exc)) from exc
     return llm_call
 
 

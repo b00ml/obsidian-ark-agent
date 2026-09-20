@@ -36,12 +36,12 @@ def load_config(config_path: str | None = None) -> dict:
 
 
 def setup_paths(config: dict) -> None:
-    """把 project_root / bili_summarizer / inbox_collector 加入 sys.path 复用既有模块"""
+    """把共享处理器和 agentlab 包根加入 sys.path。"""
     for key in ("project_root",):
         p = config.get(key)
         if p and os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
-    for sub in ("bili_summarizer", "inbox_collector"):
+    for sub in ("bili_summarizer", "inbox_collector", "agentlab"):
         d = os.path.join(config.get("project_root", ""), sub)
         if os.path.isdir(d) and d not in sys.path:
             sys.path.insert(0, d)
@@ -105,12 +105,21 @@ def chdir(path: str):
         os.chdir(old)
 
 
+# A2/OPT-227：记忆归档区（ark/memory/archive/）默认从通用 Vault 检索排除——
+# 归档 = 不可召回历史；与 agentlab rag/vector_index._EXCLUDE_DIRS 的判断保持一致。
+MEMORY_ARCHIVE_REL = "ark/memory/archive"
+
+
 def list_notes(config: dict) -> list[str]:
-    """遍历 Vault 内全部 .md 笔记（相对路径，跳过隐藏/系统目录）"""
+    """遍历 Vault 内全部 .md 笔记（相对路径，跳过隐藏/系统目录与记忆归档区）"""
     root = vault_root(config)
     notes: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
+        if rel_dir == MEMORY_ARCHIVE_REL or rel_dir.startswith(MEMORY_ARCHIVE_REL + "/"):
+            dirnames[:] = []  # 归档区整枝剪掉，不再深入
+            continue
         for fn in filenames:
             if fn.lower().endswith(".md"):
                 full = os.path.join(dirpath, fn)

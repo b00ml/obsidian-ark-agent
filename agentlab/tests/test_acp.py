@@ -391,6 +391,18 @@ class TestAcpTools(unittest.TestCase):
         out = asyncio.run(t.fn(agent="fake", question="咨询"))
         self.assertEqual(out, "你好，世界")
 
+    def test_consult_close_releases_windows_temp_cwd(self):
+        """Closing a real ACP child must release its cwd before TempDir cleanup."""
+        cfg = AgentsConfig(external=[ExternalAgentConfig(
+            name="fake", command=PY, args=[str(self.fake.script), "ok"],
+            env={"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            timeout=15.0)])
+        tools = build_acp_tools(cfg, vault_root=self.tmp.name,
+                                factory=self._factory())
+        self.assertEqual(asyncio.run(tools[0].fn(agent="fake", question="cleanup")), "你好，世界")
+        # tearDown performs the actual TemporaryDirectory cleanup. This test
+        # exists to keep the lifecycle contract explicit under Windows.
+
     def test_unknown_agent_reports_available_names(self):
         cfg = AgentsConfig(external=[ExternalAgentConfig(
             name="fake", command=PY, args=[str(self.fake.script), "ok"])])

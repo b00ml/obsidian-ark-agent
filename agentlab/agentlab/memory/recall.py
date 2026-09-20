@@ -15,13 +15,28 @@ RECALL_ITEM_CHARS = 400
 RECALL_FALLBACK = "（本轮无相关长期记忆召回）"
 
 
-def open_memory_store(cfg):
-    """构造 MemoryStore；brain 不可用/构造失败 → None（测试可 patch 此工厂）。"""
+def open_memory_store(cfg, project_id: str = ""):
+    """构造 MemoryStore；brain 不可用/构造失败 → None（测试可 patch 此工厂）。
+
+    OPT-224：project_id 非空时注入 brain config——memory_query 只召回该项目
+    与 default（共享层）的记忆。
+    """
     try:
         from agentlab.memory.store import MemoryStore
         from agentlab.tools.connectors.brain_tools import load_brain_config
 
-        store = MemoryStore(load_brain_config(cfg.model_dump()))
+        brain_cfg = load_brain_config(cfg.model_dump()) or {}
+        if project_id:
+            brain_cfg["project_id"] = project_id
+        # Keep the read/write policy in the same request-bound config consumed
+        # by tools_memory; no policy is written into memory Markdown itself.
+        memory_cfg = getattr(cfg, "memory", None)
+        if memory_cfg is not None:
+            try:
+                brain_cfg["memory_policy"] = memory_cfg.model_dump()
+            except AttributeError:
+                brain_cfg["memory_policy"] = dict(memory_cfg)
+        store = MemoryStore(brain_cfg)
         return store if store.available else None
     except Exception:  # noqa: BLE001 —— 召回是增强能力，失败静默降级
         return None
@@ -48,15 +63,23 @@ def build_memory_block(results: list, per_item_chars: int = RECALL_ITEM_CHARS) -
     return "\n".join(lines)
 
 
-def memory_block_for(cfg, topic: str, topk: int = 5) -> str:
+def memory_block_for(cfg, topic: str, topk: int = 5, project_id: str = "",
+                     session_id: str = "") -> str:
     """cfg + 本轮用户输入 → 注入块；仓库不可用/无结果/topk=0 → 空串（调用方回退占位）。"""
     if not topic or topk <= 0:
         return ""
-    store = open_memory_store(cfg)
+    store = open_memory_store(cfg, project_id)
     if store is None:
         return ""
     try:
-        q = store.query(topic, limit=topk)
+        q = store.query(topic, limit=topk, project_id=project_id or None,
+                        session_id=session_id or None)
     except Exception:  # noqa: BLE001
         return ""
-    return build_memory_block(q.get("results") if isinstance(q, dict) else [])
+    results = q.get("results") if isinstance(q, dict) else []
+    # Candidate/quarantine rows are intentionally not injected into the system
+    # prompt, even if a caller explicitly requested them for an offline query.
+    results = [r for r in results or []
+               if str((r.get("status") if isinstance(r, dict) else getattr(r, "status", "active")) or "active") == "active"
+               and not bool(r.get("bucket") if isinstance(r, dict) else getattr(r, "bucket", False))]
+    return build_memory_block(results)

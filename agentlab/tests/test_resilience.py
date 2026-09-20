@@ -85,6 +85,28 @@ class TestResilientLLM(unittest.TestCase):
             asyncio.run(rl.chat([]))
         self.assertEqual(len(prov.calls), 1)
 
+    def test_auth_failure_is_not_retried(self):
+        prov = _FakeProvider([AgentError("AGENT_LLM_AUTH", "配置错误"), "ok"])
+        rl = ResilientLLM(prov, max_retries=2, backoff=0.0)
+        with self.assertRaisesRegex(AgentError, "配置错误"):
+            asyncio.run(rl.chat([]))
+        self.assertEqual(len(prov.calls), 1)
+
+    def test_provider_schema_or_logic_exception_is_not_retried(self):
+        class BrokenProvider(LLMProvider):
+            def __init__(self):
+                self.calls = 0
+
+            async def chat(self, messages, tools=None, **kw):
+                self.calls += 1
+                raise ValueError("malformed response")
+
+        prov = BrokenProvider()
+        rl = ResilientLLM(prov, max_retries=2, backoff=0.0)
+        with self.assertRaisesRegex(AgentError, "AGENT_LLM_PROVIDER"):
+            asyncio.run(rl.chat([]))
+        self.assertEqual(prov.calls, 1)
+
     def test_circuit_open_blocks_calls(self):
         prov = _FakeProvider([AgentError("AGENT_LLM_RATE", "限流") for _ in range(10)])
         rl = ResilientLLM(

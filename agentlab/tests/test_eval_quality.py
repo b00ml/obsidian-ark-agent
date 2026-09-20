@@ -555,5 +555,33 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(_compare(better, worse), 1, "任一维变差应返回非零，供脚本卡口")
 
 
+class TestVaultCorroborationHint(unittest.TestCase):
+    """OPT-221：评审对证提示——答案字面量在 Vault 逐字命中时附加提示，未命中不附加。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.vault = Path(self.tmp.name)
+        (self.vault / "Inbox").mkdir()
+        (self.vault / "Inbox" / "n1.md").write_text(
+            "OPT-207 修复公平证据预算；broken_links_count=135 是真实计数。", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_hit_appends_hint(self):
+        ans = "检索显示 broken_links_count=135，详见 OPT-207 记录。"
+        hint = quality.vault_corroboration_hint(ans, self.vault)
+        self.assertIn("出处对证提示", hint)
+        self.assertIn("broken_links_count", hint)
+        self.assertIn("Inbox/n1.md", hint)
+
+    def test_miss_returns_empty(self):
+        self.assertEqual(quality.vault_corroboration_hint("完全无关的答案内容xyz", self.vault), "")
+
+    def test_no_vault_returns_empty(self):
+        self.assertEqual(quality.vault_corroboration_hint("anything", None), "")
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,10 +19,23 @@ import type { SpaceOSView } from "./view";
 import type ArkOSPlugin from "./main";
 import type { CrtSession, ProjectInfo } from "./settings";
 import { agentChat, agentEndpoint, resolveApproval, sessionDelete } from "./ai";
+import { copyText, previewGeneratedModal } from "./ai-asst";
 import { agentLive, notifyLive, removeLive, settleLiveStream, subscribeLive, updateLive } from "./agent-live";
 import { commitSession, newSession, touchSession } from "./session-service";
 import { createProject } from "./projects";
 import { confirmDialog, inputDialog, conflictDialog } from "./ui";
+import { writeMarkdown } from "./sync";
+import {
+  artifactsForSession, extractSessionArtifacts, upsertArtifacts, validateArtifactPaths,
+  persistProjectArtifactIndex, restoreProjectArtifacts,
+  type ArtifactToolOutput,
+} from "./artifacts";
+import { skillCatalog, SKILL_CATALOG, type ArkSkill } from "./skill-catalog";
+import {
+  buildResearchDraft, buildResearchPrompt, extractRetrievalEnvelope,
+  parseResearchRefs, researchDraftFilename, researchDraftFrontmatter,
+  stripResearchFrontmatter, type ResearchBrief,
+} from "./research-draft";
 
 // 最近一次 context-status 结果（W2 用量条数据源；refreshUsage 刷新，renderCtx 绘制）
 let wbUsage: {
@@ -46,6 +59,10 @@ class NotePickModal extends FuzzySuggestModal<TFile> {
 
 // 工作台当前会话草稿/覆盖（模块级：Tab 切走再回来不丢；与会话列表同源）
 let wbSession: CrtSession | null = null;
+// A structured brief is kept only for the session that launched the research
+// flow.  It is consumed after the first successful retrieval-backed response;
+// ordinary Agent turns never become reports by accident.
+const wbResearchBriefs = new Map<string, ResearchBrief>();
 // 编辑器联动（W3/OPT-067）：右键「发送到 Agent 工作台」的选区暂存，下一次渲染注入输入框
 let wbPrefill: string | null = null;
 // 当前工作台输入框引用（面板渲染时更新；prefill 在面板已渲染时走立即写入路径）
@@ -90,6 +107,66 @@ function draftSession(plugin: ArkOSPlugin, pid: string): CrtSession {
   return session;
 }
 
+/** Turn one explicit research run into a confirmed, traceable Vault artifact. */
+async function confirmResearchDraft(
+  plugin: ArkOSPlugin,
+  session: CrtSession,
+  brief: ResearchBrief,
+  toolOutputs: ArtifactToolOutput[],
+): Promise<void> {
+  const envelope = extractRetrievalEnvelope(toolOutputs);
+  if (!envelope) {
+    new Notice("研究草稿未捕获完整 Retrieval envelope，已保留会话，不自动写入。", 5000);
+    return;
+  }
+  const now = new Date().toISOString();
+  const built = buildResearchDraft(brief, envelope, now);
+  const folder = plugin.data.settings.reportFolder || "02-DB/报告";
+  const filename = researchDraftFilename(built.meta.title, now);
+  const path = `${folder}/${filename}.md`;
+  let previous = "";
+  const existing = plugin.app.vault.getAbstractFileByPath(path);
+  if (existing instanceof TFile) {
+    previous = await plugin.app.vault.read(existing);
+  }
+  const action = await previewGeneratedModal(
+    plugin,
+    `快速研究草稿 · ${built.meta.title}`,
+    previous,
+    built.markdown,
+  );
+  if (action === "copy") {
+    await copyText(plugin, built.markdown);
+    new Notice("研究草稿已复制，未写入 Vault");
+    return;
+  }
+  if (action !== "save") return;
+
+  const writtenPath = await writeMarkdown(
+    plugin,
+    folder,
+    filename,
+    researchDraftFrontmatter(brief, built.meta, now),
+    stripResearchFrontmatter(built.markdown),
+  );
+  // Feed the exact generated Markdown back through the existing Artifact
+  // extractor so source refs and provenance stay on the shared F3 path.
+  const artifactSession: CrtSession = {
+    ...session,
+    messages: [...session.messages, { role: "assistant", content: built.markdown }],
+  };
+  const detected = extractSessionArtifacts(artifactSession, [{
+    name: "vault_write",
+    output: JSON.stringify({ ok: true, path: writtenPath, operation: existing ? "updated" : "created" }),
+  }], now);
+  if (detected.length) {
+    upsertArtifacts(plugin, validateArtifactPaths(plugin, detected));
+    if (session.projectId) await persistProjectArtifactIndex(plugin, session.projectId);
+  }
+  await plugin.savePluginData();
+  new Notice(`研究草稿已写入：${writtenPath}`);
+}
+
 /** 解析"当前应显示的会话"：显式草稿（且项目匹配）→ crtActiveId（项目匹配）→ 该项目最近会话 → 新草稿。
  *  每次渲染现取现用——这是二期切换修复的核心约定。 */
 function currentSession(view: SpaceOSView): CrtSession {
@@ -106,13 +183,8 @@ function currentSession(view: SpaceOSView): CrtSession {
 }
 
 /** 快捷技能按钮行（#5/OPT-132）：与 skills/ 权威目录对应；内置清单，后续可配置化 */
-const SKILL_BUTTONS: { icon: string; label: string; prompt: string }[] = [
-  { icon: "🎬", label: "BV 号转写", prompt: "按 skills/bili-video-summarizer 的流程处理这个视频：" },
-  { icon: "📥", label: "处理收件箱", prompt: "按 skills/inbox-processor 的流程处理收件箱队列：" },
-  { icon: "🔍", label: "设计批判性审查", prompt: "按 skills/design-critical-review 的清单审查当前设计：" },
-  { icon: "🗒️", label: "每日回顾", prompt: "生成今天的每日回顾笔记（读取今日 Inbox 变动与已完成任务）：" },
-  { icon: "📊", label: "周报回顾", prompt: "生成上周的周报回顾（汇总 wiki/ 与 Inbox/ 的新增）：" },
-];
+/** F4：快捷按钮与技能目录共用同一份定义，避免出现两套入口语义。 */
+const SKILL_BUTTONS = SKILL_CATALOG;
 
 /** 渲染入口：SpaceOSView 的 ark Tab 主体（HUD 之下） */
 export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
@@ -198,12 +270,41 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
       ta.focus();
     });
   }
+  const catalogBtn = skillRow.createEl("button", { cls: "ark-skill-btn ark-skill-catalog", text: "技能目录",
+    attr: { title: "浏览全部技能并填入试用指令" } });
+  catalogBtn.addEventListener("click", () => {
+    new SkillPickModal(view.plugin.app, (skill) => {
+      ta.value = skill.prompt;
+      ta.focus();
+    }).open();
+  });
+  const researchBtn = skillRow.createEl("button", { cls: "ark-skill-btn ark-research-btn", text: "研究简报",
+    attr: { title: "填写问题、用途、范围和指定资料，生成只读研究 prompt" } });
+  researchBtn.addEventListener("click", () => {
+    void (async () => {
+      const targetSessionId = currentSession(view).id;
+      const question = await inputDialog(view.plugin, { title: "研究问题", placeholder: "你要比较、判断或解释什么？", multiline: true });
+      if (!question?.trim()) return;
+      const purpose = await inputDialog(view.plugin, { title: "研究用途", placeholder: "技术选型、决策记录、学习准备……" });
+      const scope = await inputDialog(view.plugin, { title: "资料范围", placeholder: "例如 wiki/ 或当前 Project scope" });
+      const refsRaw = await inputDialog(view.plugin, { title: "指定 Markdown 资料（可选）", placeholder: "多个路径用逗号或换行分隔" });
+      const refs = parseResearchRefs(refsRaw || "");
+      const invalidCount = (refsRaw || "").split(/[\n,，、;；]+/).map((item) => item.trim()).filter(Boolean).length - refs.length;
+      if (invalidCount > 0) new Notice(`已忽略 ${invalidCount} 个非安全 Markdown 路径`);
+      const brief: ResearchBrief = {
+        question: question.trim(), purpose: purpose?.trim(), scope: scope?.trim(), specifiedRefs: refs,
+      };
+      wbResearchBriefs.set(targetSessionId, brief);
+      ta.value = buildResearchPrompt(brief);
+      ta.focus();
+    })();
+  });
 
   function renderAll() {
     const sess = currentSession(view);
     renderSide(view, side, sess, renderAll);
     renderFlowInto(flow, view, sess);
-    renderCtx(view, ctx, (msg) => void send(msg));
+    renderCtx(view, ctx, (msg) => void send(msg), sess);
     void refreshUsage(view, ctx);
     const running = agentLive.has(sess.id);
     sendBtn.style.display = running ? "none" : "";
@@ -291,7 +392,7 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
       const data = JSON.parse(text);
       if (data?.ok) {
         wbUsage = data;
-        renderCtx(v, ctxEl, (msg: string) => void send(msg));
+        renderCtx(v, ctxEl, (msg: string) => void send(msg), sess);
       }
     } catch { /* 旧版 serve 无此端点 → 静默 */ }
   }
@@ -345,6 +446,7 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
     const chips = liveWrap?.querySelector<HTMLElement>(".agent-wb-chips") ?? null;
     const liveStat = liveWrap?.querySelector<HTMLElement>(".agent-wb-status") ?? null;
     const approvalCards = new Map<string, HTMLElement>();
+    const toolOutputs: ArtifactToolOutput[] = [];
     // P2-2/F5-019：分支进度卡（response.branch.*）+ 汇总行（response.multi.summary）
     const branches = new Map<string, BranchProgress>();
     const branchBox = multiNames.length && liveWrap?.isConnected
@@ -388,6 +490,7 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
       flow.scrollTop = flow.scrollHeight;
     };
 
+    let researchToFinalize: ResearchBrief | null = null;
     try {
       const reply = await agentChat(s, sess.messages, {
         onText: (d: string) => {
@@ -404,6 +507,7 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
             lv.tools.push({ name, phase, output: detail });
             notifyLive(sess.id);
           }
+          if (phase === "done" && detail) toolOutputs.push({ name, output: detail });
           if (!chips || !anchorAlive()) return;
           chips.createSpan({ cls: `agent-wb-chip ${phase === "start" ? "run" : "done"}`,
             text: phase === "start" ? `🔧 ${name}…` : `${name} ✓` });
@@ -416,7 +520,20 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
         onApproval: (event: { phase: "requested" | "resolved"; approval: any }) => {
           const a = event.approval || {};
           const id = String(a.approval_id || "");
-          if (!id || id === "policy") return;
+          if (!id) return;
+          if (id === "policy") {
+            // OPT-222：策略自动放行必须用户可见——此前静默 return，write 工具在
+            // allowlist 内自动执行时用户看不到任何提示，长任务期间误判"卡住"而反复重发
+            // （真机 4 次重试 3 次断连白跑的根因之一）。
+            if (anchorAlive() && chips) {
+              chips.createSpan({
+                cls: "agent-wb-chip done",
+                text: `⚡ ${a.tool_name || "工具"} 已按策略自动放行`,
+              });
+              flow.scrollTop = flow.scrollHeight;
+            }
+            return;
+          }
           if (event.phase === "requested" && chips && anchorAlive()) {
             const card = chips.createDiv({ cls: "agent-wb-approval" });
             card.createDiv({ cls: "agent-wb-approval-title", text: `需要确认：${a.tool_name || "危险工具"}` });
@@ -480,6 +597,14 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
         if (lv?.settled && lv.settleIdx != null) sess.messages[lv.settleIdx].content = reply;
         else sess.messages.push({ role: "assistant", content: reply });
       }
+      const detected = extractSessionArtifacts(sess, toolOutputs);
+      if (detected.length) {
+        upsertArtifacts(view.plugin, validateArtifactPaths(view.plugin, detected));
+        if (sess.projectId) void persistProjectArtifactIndex(view.plugin, sess.projectId);
+        void view.plugin.savePluginData();
+      }
+      researchToFinalize = wbResearchBriefs.get(sess.id) ?? null;
+      if (researchToFinalize) wbResearchBriefs.delete(sess.id);
       // 完成路径也必须清理 live；否则工作台会一直显示运行中且后续发送被拦截。
       updateLive(sess.id, { status: "completed", elapsed: Math.floor((Date.now() - startedAt) / 1000) });
       removeLive(sess.id);
@@ -525,6 +650,13 @@ export function renderAgentWorkbench(view: SpaceOSView, mount: HTMLElement) {
     await view.plugin.savePluginData();
     setRunning(false, sess);
     renderAll();
+    if (researchToFinalize) {
+      try {
+        await confirmResearchDraft(view.plugin, sess, researchToFinalize, toolOutputs);
+      } catch (error: any) {
+        new Notice(`研究草稿处理失败，未自动重试：${String(error?.message ?? error)}`, 6000);
+      }
+    }
   }
 
   function setRunning(on: boolean, sess: CrtSession) {
@@ -705,6 +837,7 @@ async function onProjectChange(view: SpaceOSView, v: string, rerender: () => voi
   settleLiveStream(currentSession(view));
   s.activeProjectId = v;
   wbSession = null;
+  if (v.trim()) await restoreProjectArtifacts(view.plugin, v.trim());
   await view.plugin.savePluginData();
   rerender();
   const pname = (s.projects || []).find((p: ProjectInfo) => p.id === v)?.name || "全局";
@@ -762,7 +895,7 @@ async function onDeleteProject(view: SpaceOSView, pid: string, rerender: () => v
 
 /** 右侧项目上下文条（W2）：项目/规则入口 + 用量可视化 + 手动压缩（onCompress 走对话管线） */
 function renderCtx(view: SpaceOSView, ctx: HTMLElement,
-                   onCompress: (msg: string) => void) {
+                   onCompress: (msg: string) => void, sess: CrtSession) {
   ctx.empty();
   const s = view.plugin.data.settings;
   const pid = activePid(view);
@@ -790,6 +923,8 @@ function renderCtx(view: SpaceOSView, ctx: HTMLElement,
     ctx.createDiv({ cls: "agent-wb-muted", text: "上下文用量：发起一次对话后显示（需 agentlab serve ≥ 今日版本）。" });
   }
 
+  renderArtifactSection(view, ctx, sess);
+
   // —— 项目规则入口 ——
   if (!pid) {
     ctx.createDiv({ cls: "agent-wb-muted",
@@ -805,4 +940,48 @@ function renderCtx(view: SpaceOSView, ctx: HTMLElement,
     });
   }
   ctx.createDiv({ cls: "agent-wb-muted", text: "规则优先于全局规范。" });
+}
+
+class SkillPickModal extends FuzzySuggestModal<ArkSkill> {
+  constructor(app: any, private onPick: (skill: ArkSkill) => void) {
+    super(app);
+    this.setPlaceholder("选择技能（只填入指令，不会自动发送）");
+  }
+  getItems() { return skillCatalog(); }
+  getItemText(skill: ArkSkill): string { return `${skill.icon} ${skill.label}`; }
+  onChooseItem(skill: ArkSkill): void { this.onPick(skill); }
+}
+
+/** F3：展示本轮已识别的成果文件，并将已校验路径直接打开。 */
+function renderArtifactSection(view: SpaceOSView, ctx: HTMLElement, sess: CrtSession): void {
+  const artifacts = artifactsForSession(view.plugin, sess.id);
+  const title = ctx.createDiv({ cls: "agent-wb-side-title", text: "成果" });
+  if (!artifacts.length) {
+    title.insertAdjacentElement("afterend", ctx.createDiv({
+      cls: "agent-wb-muted", text: "本轮尚未识别到 Agent 创建或修改的笔记。",
+    }));
+    return;
+  }
+  const list = ctx.createDiv({ cls: "agent-wb-artifacts" });
+  artifacts.forEach((artifact) => {
+    const card = list.createDiv({ cls: `agent-wb-artifact ${artifact.status}` });
+    const head = card.createDiv({ cls: "agent-wb-artifact-head" });
+    head.createSpan({ cls: "agent-wb-artifact-kind", text: artifact.kind === "note" ? "笔记" : artifact.kind });
+    head.createSpan({ cls: "agent-wb-artifact-status", text: artifact.status === "validated" ? "已校验" : artifact.status === "missing" ? "路径不存在" : artifact.status });
+    if (artifact.version && artifact.version > 1) {
+      head.createSpan({ cls: "agent-wb-artifact-version", text: `v${artifact.version}` });
+    }
+    const link = card.createDiv({ cls: "agent-wb-link", text: artifact.path, attr: { title: "打开成果文件" } });
+    link.addEventListener("click", () => {
+      const file = view.plugin.app.vault.getAbstractFileByPath(artifact.path);
+      if (file) void view.plugin.app.workspace.getLeaf("tab").openFile(file as any);
+      else new Notice(`成果文件不存在：${artifact.path}`);
+    });
+    if (artifact.source_refs.length) {
+      card.createDiv({ cls: "agent-wb-artifact-sources", text: `来源 ${artifact.source_refs.length} 条` });
+    }
+    if (artifact.previous_path) {
+      card.createDiv({ cls: "agent-wb-artifact-sources", text: `由 ${artifact.previous_path} 重命名` });
+    }
+  });
 }

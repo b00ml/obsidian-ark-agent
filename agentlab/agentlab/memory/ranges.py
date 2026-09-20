@@ -214,8 +214,10 @@ class RangeGateway:
     def recaller(self):
         """session 召回路（RAGRecall.extra 形状）：向量优先，空则 jsonl 关键词兜底。"""
 
-        def session_recall(q: str) -> list[dict]:
-            sid = _current_sid.get()
+        def session_recall(q: str, scope=None) -> list[dict]:
+            # Prefer the explicit S0 request scope; ContextVar remains the
+            # compatibility fallback for callers that bind a session directly.
+            sid = getattr(scope, "session_id", "") or _current_sid.get()
             if not sid:
                 return []
             hits: list[dict] = []

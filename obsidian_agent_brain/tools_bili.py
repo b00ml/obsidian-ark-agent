@@ -5,8 +5,37 @@
 """
 import os
 import re
+import uuid
 
 from common import chdir, setup_paths, vault_root
+
+
+def _stage_tracker(config: dict, pipeline: str):
+    """Create one request-local, serializable stage trace when agentlab is available."""
+    setup_paths(config)
+    try:
+        from agentlab.contracts import ProcessStatus
+        from agentlab.runtime.operation_context import current_operation_id
+        from agentlab.runtime.stages import StageTracker
+    except (ImportError, ModuleNotFoundError):
+        return None, None
+    operation_id = current_operation_id()
+    run_id = operation_id or f"{pipeline}-{uuid.uuid4().hex[:16]}"
+    return StageTracker(run_id, uuid.uuid4().hex[:16], operation_id=operation_id), ProcessStatus
+
+
+def _record_stage(tracker, statuses, stage_id: str, *, status, warnings=None,
+                  artifact_refs=None, error_code: str = "", retryable: bool = False) -> None:
+    if tracker is not None:
+        tracker.record(stage_id, stage_id, status=status, warnings=warnings,
+                       artifact_refs=artifact_refs, error_code=error_code,
+                       retryable=retryable)
+
+
+def _with_stages(result: dict, tracker) -> dict:
+    if tracker is not None:
+        result["stages"] = tracker.to_dict()
+    return result
 
 
 def _import_bili(config: dict):
@@ -58,9 +87,20 @@ def _transcript_note(config: dict, bvid: str, title: str,
         "",
     ]
     path = os.path.join(note_dir, f"{safe}-逐字稿.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(head) + "\n\n" + str(transcript).strip() + "\n")
+    _pipeline_write(path, "\n".join(head) + "\n\n" + str(transcript).strip() + "\n",
+                    config, actor="brain-bili-transcript")
     return path
+
+
+def _pipeline_write(path: str, content: str, config: dict, actor: str) -> dict:
+    """brain 内管线产物的受控写入：复用 bili_summarizer.vault_io（P0-01）。"""
+    import sys as _sys
+    _bili_dir = os.path.join(config.get("project_root", ""), "bili_summarizer")
+    if _bili_dir not in _sys.path:
+        _sys.path.insert(0, _bili_dir)
+    from vault_io import controlled_write
+    return controlled_write(path, content, vault_root=vault_root(config),
+                            overwrite=True, actor=actor)
 
 
 def _cleanup_temp(workdir: str) -> list[str]:
@@ -110,43 +150,56 @@ def bili_transcribe(config: dict, bvid: str, quality: str = "fast",
     为 None 时按其默认规则自动决定（GPU 加速、模型映射、VAD 开启）。
     返回 title / transcript / strategy / meta；全部失败抛错（含降级链路信息）。
     """
-    bili = _import_bili(config)
-    bvid = bili.extract_bvid(bvid)
-    cookie_path = _cookie_path(config)
+    tracker, statuses = _stage_tracker(config, "bili-transcribe")
+    try:
+        _record_stage(tracker, statuses, "accepted", status=statuses.ACCEPTED)
+        bili = _import_bili(config)
+        bvid = bili.extract_bvid(bvid)
+        cookie_path = _cookie_path(config)
 
-    def _run():
-        bili.ensure_ffmpeg()
-        cookie = bili.load_cookie(cookie_path)
-        result = bili.strategy_api(bvid, cookie, trust_ai=trust_ai)
-        strategy = 1
-        if not result and cookie:
-            new_cookie = bili.refresh_cookie(cookie, cookie_path)
-            if new_cookie != cookie:
-                cookie = new_cookie
-                result = bili.strategy_api(bvid, cookie, trust_ai=trust_ai)
-        if not result:
-            result = bili.strategy_ytdlp_subtitle(bvid)
-            strategy = 2
-        if not result:
-            result = bili.strategy_whisper(
-                bvid, quality,
-                whisper_model=whisper_model,
-                device=whisper_device,
-                beam=beam,
-                vad=vad,
-            )
-            strategy = 3
-        if not result:
-            raise RuntimeError(
-                f"[BILI] 3层降级全部失败 bvid={bvid} "
-                f"(API → yt-dlp → Whisper)，请检查 Cookie/网络/BV号")
-        title, transcript = result
-        meta = bili.get_video_meta(bvid, cookie)
-        return title, transcript, strategy, meta
+        def _run():
+            bili.ensure_ffmpeg()
+            cookie = bili.load_cookie(cookie_path)
+            result = bili.strategy_api(bvid, cookie, trust_ai=trust_ai)
+            strategy = 1
+            if not result and cookie:
+                new_cookie = bili.refresh_cookie(cookie, cookie_path)
+                if new_cookie != cookie:
+                    cookie = new_cookie
+                    result = bili.strategy_api(bvid, cookie, trust_ai=trust_ai)
+            if not result:
+                result = bili.strategy_ytdlp_subtitle(bvid)
+                strategy = 2
+            if not result:
+                result = bili.strategy_whisper(
+                    bvid, quality,
+                    whisper_model=whisper_model,
+                    device=whisper_device,
+                    beam=beam,
+                    vad=vad,
+                )
+                strategy = 3
+            if not result:
+                raise RuntimeError(
+                    f"[BILI] 3层降级全部失败 bvid={bvid} "
+                    f"(API → yt-dlp → Whisper)，请检查 Cookie/网络/BV号")
+            title, transcript = result
+            return title, transcript, strategy, cookie
 
-    title, transcript, strategy, meta = _run_in_bili(_run, config)
-    return {"bvid": bvid, "title": title, "strategy": strategy,
-            "char_count": len(transcript), "transcript": transcript, "meta": meta}
+        title, transcript, strategy, cookie = _run_in_bili(_run, config)
+        _record_stage(tracker, statuses, "fetched", status=statuses.FETCHED)
+        _record_stage(tracker, statuses, "parsed", status=statuses.PARSED)
+        meta = _run_in_bili(lambda: bili.get_video_meta(bvid, cookie), config)
+        _record_stage(tracker, statuses, "enriched", status=statuses.ENRICHED)
+        _record_stage(tracker, statuses, "completed", status=statuses.COMPLETED)
+        return _with_stages({"bvid": bvid, "title": title, "strategy": strategy,
+                             "char_count": len(transcript), "transcript": transcript,
+                             "meta": meta}, tracker)
+    except Exception as exc:
+        if statuses is not None:
+            _record_stage(tracker, statuses, "failed", status=statuses.FAILED,
+                          error_code=type(exc).__name__)
+        raise
 
 
 def bili_meta(config: dict, bvid: str) -> dict:

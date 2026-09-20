@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -44,7 +45,8 @@ class InboxQueueStore:
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    operation_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS inbox_task_status
                     ON inbox_task(status, created_at);
@@ -52,8 +54,21 @@ class InboxQueueStore:
                     marker TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS inbox_operation (
+                    operation_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    before_hash TEXT NOT NULL,
+                    after_hash TEXT,
+                    new_tasks INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    error_code TEXT
+                );
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(inbox_task)")}
+            if "operation_id" not in columns:
+                conn.execute("ALTER TABLE inbox_task ADD COLUMN operation_id TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -71,6 +86,7 @@ class InboxQueueStore:
             "url": row["url"],
             "status": row["status"],
             "retry_count": row["retry_count"],
+            "operation_id": row["operation_id"] or "",
         })
         return task
 
@@ -102,8 +118,8 @@ class InboxQueueStore:
                         cur = conn.execute(
                             """INSERT OR IGNORE INTO inbox_task
                                (id,type,url,dedupe_key,status,retry_count,
-                                payload_json,created_at,updated_at)
-                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                                payload_json,created_at,updated_at,operation_id)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
                             (task.get("id") or uuid.uuid4().hex[:16],
                              str(task.get("type", "unknown")),
                              str(task.get("url", "")), dedupe,
@@ -111,7 +127,8 @@ class InboxQueueStore:
                              int(task.get("retry_count", 0) or 0),
                              json.dumps(task, ensure_ascii=False,
                                         separators=(",", ":")),
-                             task.get("received_at") or now, now),
+                             task.get("received_at") or now, now,
+                             str(task.get("operation_id") or "") or None),
                         )
                         imported_tasks += cur.rowcount
             for marker in self._legacy_seen(self.seen_path):
@@ -135,7 +152,7 @@ class InboxQueueStore:
             conn.close()
 
     def enqueue(self, task: dict[str, Any], dedupe_key: str,
-                markers: list[str]) -> bool:
+                markers: list[str], operation_id: str = "") -> bool:
         """Commit one task and all seen markers in a single transaction.
 
         A duplicate dedupe key must still persist the new message marker.
@@ -148,15 +165,16 @@ class InboxQueueStore:
             cur = conn.execute(
                 """INSERT INTO inbox_task
                    (id,type,url,dedupe_key,status,retry_count,payload_json,
-                    created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)
+                    created_at,updated_at,operation_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(dedupe_key) DO NOTHING""",
                 (str(task.get("id") or uuid.uuid4().hex[:16]),
                  str(task.get("type", "unknown")), str(task.get("url", "")),
                  dedupe_key, str(task.get("status", "pending")),
                  int(task.get("retry_count", 0) or 0),
                  json.dumps(task, ensure_ascii=False, separators=(",", ":")),
-                 task.get("received_at") or now, now),
+                 task.get("received_at") or now, now,
+                 str(operation_id or task.get("operation_id") or "") or None),
             )
             inserted = cur.rowcount == 1
             for marker in markers:
@@ -166,6 +184,90 @@ class InboxQueueStore:
                 )
             conn.commit()
             return inserted
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _snapshot_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str, str]]:
+        rows = conn.execute(
+            "SELECT id,type,url,status,updated_at FROM inbox_task ORDER BY id"
+        ).fetchall()
+        return [tuple(str(value or "") for value in row) for row in rows]
+
+    def snapshot_hash(self) -> str:
+        """Return a deterministic queue state digest without exposing payloads."""
+        conn = self._connect()
+        try:
+            raw = json.dumps(self._snapshot_rows(conn), ensure_ascii=False,
+                             separators=(",", ":"))
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        finally:
+            conn.close()
+
+    def begin_collection(self, operation_id: str, *, before_hash: str = "") -> bool:
+        """Register a collection before any external mail calls are made."""
+        op_id = str(operation_id or "").strip()[:256]
+        if not op_id:
+            return False
+        now = self._now()
+        conn = self._connect()
+        try:
+            if not before_hash:
+                before_hash = hashlib.sha256(b"[]").hexdigest()
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO inbox_operation
+                   (operation_id,status,before_hash,started_at)
+                   VALUES (?,?,?,?)""",
+                (op_id, "running", str(before_hash)[:128], now),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def complete_collection(self, operation_id: str, *, after_hash: str,
+                            new_tasks: int) -> bool:
+        op_id = str(operation_id or "").strip()[:256]
+        if not op_id:
+            return False
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """UPDATE inbox_operation SET status='succeeded',after_hash=?,
+                   new_tasks=?,completed_at=? WHERE operation_id=? AND status='running'""",
+                (str(after_hash)[:128], max(0, int(new_tasks)), self._now(), op_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def fail_collection(self, operation_id: str, *, error_code: str) -> bool:
+        op_id = str(operation_id or "").strip()[:256]
+        if not op_id:
+            return False
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """UPDATE inbox_operation SET status='failed',error_code=?,
+                   completed_at=? WHERE operation_id=? AND status='running'""",
+                (str(error_code)[:128], self._now(), op_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def collection_operation(self, operation_id: str) -> dict[str, Any] | None:
+        op_id = str(operation_id or "").strip()[:256]
+        if not op_id:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM inbox_operation WHERE operation_id=?", (op_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
         finally:
             conn.close()
 

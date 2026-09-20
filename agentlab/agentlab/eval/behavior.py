@@ -91,7 +91,8 @@ def _memory_duplicate_write() -> dict[str, Any]:
         markdown = MemoryMarkdownStore(root)
 
         class Adapter:
-            def memory_commit(self, _config, content, tags, source_session):
+            def memory_commit(self, _config, content, tags, source_session, importance=None,
+                              mem_type="context", bucket=False, confidence=None):
                 return {"status": "committed", "id": markdown.commit(content, tags=tags or [])}
 
             def memory_query(self, _config, topic, limit):

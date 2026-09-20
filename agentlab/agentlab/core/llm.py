@@ -64,6 +64,26 @@ class OpenAICompatProvider(LLMProvider):
         self.timeout = timeout
         self.max_tokens = max_tokens
         self._httpx = httpx_client
+        # Lazily created so construction remains independent from an event
+        # loop.  A long-lived provider (serve) can therefore reuse HTTP
+        # connections across turns while tests/CLI may still inject a client.
+        self._owned_httpx = None
+
+    async def _client(self):
+        """Return the injected or process-owned async client."""
+        if self._httpx is not None:
+            return self._httpx
+        if self._owned_httpx is None:
+            import httpx
+
+            self._owned_httpx = httpx.AsyncClient(timeout=self.timeout)
+        return self._owned_httpx
+
+    async def aclose(self) -> None:
+        """Close the lazily owned connection pool; injected clients stay caller-owned."""
+        client, self._owned_httpx = self._owned_httpx, None
+        if client is not None:
+            await client.aclose()
 
     async def chat(
         self,
@@ -75,10 +95,7 @@ class OpenAICompatProvider(LLMProvider):
         stream: bool = False,
         on_stream: Callable[[str], None] | None = None,
     ) -> LLMResponse:
-        import httpx
-
-        client = self._httpx or httpx.AsyncClient(timeout=self.timeout)
-        owned = self._httpx is None
+        client = await self._client()
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [m.to_provider_dict() for m in messages],
@@ -100,10 +117,6 @@ class OpenAICompatProvider(LLMProvider):
             raise AgentError("AGENT_LLM_TIMEOUT", f"LLM 调用超时（{self.timeout}s）") from None
         except Exception as e:  # 网络类故障统一包装
             raise AgentError("AGENT_LLM_TIMEOUT", f"LLM 网络错误：{e}") from None
-        finally:
-            if owned:
-                await client.aclose()
-
         if resp.status_code == 429:
             raise AgentError("AGENT_LLM_RATE", "LLM 限流（HTTP 429）")
         if resp.status_code != 200:
@@ -111,10 +124,15 @@ class OpenAICompatProvider(LLMProvider):
                 "AGENT_LLM_TIMEOUT" if resp.status_code >= 500 else "AGENT_LLM_AUTH",
                 f"LLM 返回 HTTP {resp.status_code}: {resp.text[:200]}",
             )
-        data = resp.json()
-        choice = data["choices"][0]["message"]
-        usage = data.get("usage") or {}
-        return self._parse(choice, usage)
+        try:
+            data = resp.json()
+            choice = data["choices"][0]["message"]
+            usage = data.get("usage") or {}
+            return self._parse(choice, usage)
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise AgentError(
+                "AGENT_LLM_SCHEMA", f"LLM 响应结构无效：{type(exc).__name__}"
+            ) from exc
 
     def _parse(self, choice: dict, usage: dict) -> LLMResponse:
         content = choice.get("content")

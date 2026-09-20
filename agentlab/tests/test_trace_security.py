@@ -36,6 +36,19 @@ class TestTrace(unittest.TestCase):
         self.assertIn("[REDACTED]", lines[0])
         self.assertIn("DONE", lines[1])
 
+    def test_kv_secrets_redacted(self):
+        # P0-06：JSON/查询串键值形态的 api_key/cookie 值不得进 trace 明文
+        t = Tracer(self.dir)
+        t.new_session()
+        t.record({"payload": '{"api_key": "skvABCDEF123456", "model": "m"}'})
+        t.record({"note": "cookie=abcdef1234567890; path=/"})
+        fp = os.path.join(self.dir, f"{t.trace_id}.jsonl")
+        with open(fp, encoding="utf-8") as f:
+            body = f.read()
+        self.assertNotIn("skvABCDEF123456", body)
+        self.assertIn("[REDACTED]", body)
+        self.assertNotIn("abcdef1234567890", body)
+
     def test_run_diagnostics_are_correlated_and_redacted(self):
         t = Tracer(self.dir)
         t.new_session()

@@ -23,6 +23,29 @@ class TestMemoryStore(unittest.TestCase):
         store = MemoryStore(self.config)
         self.assertTrue(store.available)
 
+
+    def test_source_session_anchor_and_importance_passthrough(self):
+        """OPT-224：构造期 source_session 锚 + importance 透传到 frontmatter。"""
+        store = MemoryStore({"vault_path": self._root, "brain_dir": ".agent-brain"},
+                            source_session="sess-anchor-1")
+        store.commit("带会话锚的记忆", tags=["anchor"], importance=9)
+        import glob as _g
+        mds = _g.glob(str(self._root) + "/ark/memory/**/*.md", recursive=True)
+        hit = [f for f in mds if "带会话锚的记忆" in open(f, encoding="utf-8").read()]
+        self.assertTrue(hit)
+        body = open(hit[0], encoding="utf-8").read()
+        self.assertIn("source_session: sess-anchor-1", body)
+        self.assertIn("importance: 9", body)
+
+    def test_commit_without_anchor_keeps_empty(self):
+        store = MemoryStore({"vault_path": self._root, "brain_dir": ".agent-brain"})
+        store.commit("无锚记忆", tags=["noanchor"])
+        import glob as _g
+        mds = _g.glob(str(self._root) + "/ark/memory/**/*.md", recursive=True)
+        hit = [f for f in mds if "无锚记忆" in open(f, encoding="utf-8").read()]
+        self.assertTrue(hit)
+        self.assertNotIn("source_session: sess", open(hit[0], encoding="utf-8").read())
+
     def test_commit_and_query_roundtrip(self):
         store = MemoryStore(self.config)
         r = store.commit("复用观点：长任务用线程池防阻塞", tags=["agentlab", "并发"])

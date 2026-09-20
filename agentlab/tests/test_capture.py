@@ -124,7 +124,8 @@ class _FakeMemory:
         return {"status": "ok", "total": len(self.query_results),
                 "results": list(self.query_results)}
 
-    def memory_commit(self, cfg, content, tags, source_session):
+    def memory_commit(self, cfg, content, tags, source_session, importance=None,
+                        mem_type="context", bucket=False, confidence=None):
         self.commits += 1
         return {"status": "committed", "id": self.commits}
 

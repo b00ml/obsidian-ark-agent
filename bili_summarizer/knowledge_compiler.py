@@ -24,6 +24,7 @@ import re
 from datetime import date
 
 from prompt_loader import load_prompt, render
+from vault_io import controlled_write, guard_vault_path  # P0-01 受控写入
 
 # 提取条目上限（prompt 已同步约束，二次校验兜底）
 MAX_ENTRIES = 12
@@ -203,7 +204,8 @@ def _pinyin_sort_key(name: str) -> str:
         return name.lower()
 
 
-def _update_index(wiki_root: str, items: list[tuple[str, str]]) -> None:
+def _update_index(wiki_root: str, items: list[tuple[str, str]],
+                  vault_root: str | None = None) -> None:
     """更新 wiki/index.md 总目录：概念/实体分节、排序去重（全量重写保证幂等）。
 
     非托管分节（用户手工加的其他目录节）原样保留；条目只增不删。
@@ -250,17 +252,18 @@ def _update_index(wiki_root: str, items: list[tuple[str, str]]) -> None:
         out.append(body.rstrip("\n"))
         out.append("")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(out).rstrip("\n") + "\n")
+    controlled_write(path, "\n".join(out).rstrip("\n") + "\n",
+                     vault_root=vault_root, overwrite=True, actor="knowledge-compile")
 
 
 def _append_log(wiki_root: str, note_title: str, created_n: int, updated_n: int,
-                conflict_n: int, today: str) -> None:
+                conflict_n: int, today: str, vault_root: str | None = None) -> None:
     """wiki/log.md 末尾追加一行：日期 | 笔记标题 | 新建N/合并M/冲突K。
 
     幂等：完全相同的行（同日期同笔记同计数）不重复追加。
     """
     path = os.path.join(wiki_root, "log.md")
+    guard_vault_path(vault_root, os.path.abspath(path))
     line = f"{today} | {note_title} | 新建{created_n}/合并{updated_n}/冲突{conflict_n}"
     old = ""
     if os.path.exists(path):
@@ -346,19 +349,18 @@ def compile_note(vault_root: str, note_path: str, note_title: str, note_content:
                 page_text = page_text.rstrip("\n") + "\n" + \
                     _merge_section(note_title, new_core, today)
                 updated.append(name)
-            with open(page_path, "w", encoding="utf-8") as f:
-                f.write(page_text)
+            controlled_write(page_path, page_text, vault_root=vault_root,
+                             overwrite=True, actor="knowledge-compile")
         else:
-            os.makedirs(page_dir, exist_ok=True)
-            with open(page_path, "w", encoding="utf-8") as f:
-                f.write(_new_page(name, kind, new_core, note_title, today))
+            controlled_write(page_path, _new_page(name, kind, new_core, note_title, today),
+                             vault_root=vault_root, overwrite=True, actor="knowledge-compile")
             created.append(name)
         touched.append((name, kind))
 
     if touched:
-        _update_index(wiki_root, touched)
+        _update_index(wiki_root, touched, vault_root=vault_root)
         _append_log(wiki_root, note_title, len(created), len(updated),
-                    len(conflicts), today)
+                    len(conflicts), today, vault_root=vault_root)
 
     return {"created": created, "updated": updated,
             "conflicts": conflicts, "skipped": skipped}

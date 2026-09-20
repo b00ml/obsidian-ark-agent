@@ -30,7 +30,7 @@ _BANNER = "agentlab · 轻量 Agent 框架 · 输入问题（exit 退出）"
 
 
 def _build_registry(cfg, with_brain: bool, rag_llm=None,
-                    index=None, range_gateway=None) -> tuple[ToolRegistry, int]:
+                    index=None, p2_store=None, range_gateway=None) -> tuple[ToolRegistry, int]:
     from agentlab.tools.web_search import WEB_SEARCH_TOOLS
 
     brain_tools = []
@@ -52,11 +52,14 @@ def _build_registry(cfg, with_brain: bool, rag_llm=None,
         reg.register(t)
     # P4 Agentic RAG：rag_retrieve / rag_assess（read）
     from agentlab.tools.connectors.brain_tools import load_brain_config
+    brain_config = load_brain_config(cfg.model_dump())
+    if brain_config is not None:
+        brain_config["memory_policy"] = cfg.memory.model_dump()
     from agentlab.tools.rag_tools import build_rag_tools
-    for t in build_rag_tools(load_brain_config(cfg.model_dump()), rag_llm,
+    for t in build_rag_tools(brain_config, rag_llm,
                              item_chars=cfg.limits.recall_item_chars,
                              rag_config=cfg.rag, vault_root=cfg.vault_root,
-                             index=index, range_gateway=range_gateway):
+                             index=index, p2_store=p2_store, range_gateway=range_gateway):
         if t.name not in brain_names:
             reg.register(t)
     # P2-1/OPT-112：外部 ACP agent（agents.external 配置了才注册，未配置零影响）
@@ -174,8 +177,11 @@ def _resilient_for_model(cfg, model: str, max_tokens: int | None = None) -> "Res
     )
 
 
-def _build_runner(cfg, registry: ToolRegistry | None = None) -> Runner:
-    resilient = _make_resilient(cfg)
+def _build_runner(cfg, registry: ToolRegistry | None = None, provider=None) -> Runner:
+    # A serve instance passes its long-lived provider here.  CLI callers keep
+    # the previous construction behavior while still benefiting from the
+    # provider's lazy connection pool for the duration of a run.
+    resilient = provider or _make_resilient(cfg)
     # P3 预算管理：超预算时用 resilient LLM 作摘要器走结构化压缩，而非直接 guardrail
     from agentlab.memory.working import WorkingMemory
     wm = WorkingMemory(
@@ -248,12 +254,23 @@ def _attach_trace(runner: Runner, cfg) -> Tracer | None:
     return tracer
 
 
+def _attach_depository(cfg, run_cfg: "RunConfig") -> "RunConfig":
+    """A1/OPT-229：CLI 与 serve 的记忆沉淀接线对齐（复用 serve 实现，含降级语义）。"""
+    try:
+        from agentlab.runtime.serve import _attach_depository as _serve_attach
+        return _serve_attach(cfg, run_cfg, source_session="cli")
+    except Exception:
+        return run_cfg
+
+
 async def _run_once(cfg, question: str, agent, reg, *, yes: bool = False) -> None:
     runner = _build_runner(cfg, registry=reg)
     tracer = _attach_trace(runner, cfg)
     hooks = build_hooks(cfg, yes=yes, trace=tracer)
     agent.tools = reg.all()
-    result = await runner.run(agent, question, hooks=hooks, cfg=RunConfig.from_config(cfg))
+    run_cfg = RunConfig.from_config(cfg)
+    run_cfg = _attach_depository(cfg, run_cfg)
+    result = await runner.run(agent, question, hooks=hooks, cfg=run_cfg)
     if tracer is not None and result:
         result.trace_id = getattr(tracer, "trace_id", "")
     if result.final_output:
@@ -291,6 +308,17 @@ def cmd_run(args) -> int:
     return 0
 
 
+def _refresh_repl_instructions(agent, cfg, reg, question: str) -> None:
+    """A1/OPT-229：repl 每轮按当前输入重建 system instructions（含记忆注入块）。"""
+    from agentlab.memory.recall import memory_block_for
+
+    agent.instructions = _system_instruction(
+        cfg, reg.all(),
+        memory=memory_block_for(
+            cfg, question,
+            topk=int(getattr(cfg.limits, "memory_inject_topk", 5) or 0)))
+
+
 def cmd_repl(args) -> int:
     cfg = _cfg.load_config(path=args.config)
     rag_llm = None
@@ -310,12 +338,15 @@ def cmd_repl(args) -> int:
     hooks = build_hooks(cfg, yes=args.yes, trace=tracer)
 
     def run_once(question: str):
+        # A1/OPT-229：每轮按当前输入重建记忆注入（此前只在启动时组装一次）
+        _refresh_repl_instructions(agent, cfg, reg, question)
+
         result = None
 
         async def _run():
-            return await runner.run(
-                agent, question, hooks=hooks, cfg=RunConfig.from_config(cfg)
-            )
+            run_cfg = RunConfig.from_config(cfg)
+            run_cfg = _attach_depository(cfg, run_cfg)
+            return await runner.run(agent, question, hooks=hooks, cfg=run_cfg)
         return asyncio.run(_run())
 
     print(f"{_BANNER} · tools={len(reg.all())}（brain={n_brain}）")

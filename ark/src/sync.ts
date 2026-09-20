@@ -5,6 +5,7 @@ import type ArkOSPlugin from "./main";
 import { generateId, getToday } from "./utils";
 import { parseRecurrence } from "./recurrence";
 import { ensureDashboardFile } from "./dashboard";
+import { isRagReconcilePath, scheduleRagReconcile, stopRagReconcile } from "./rag-reconcile";
 
 function str(v: any, d = ""): string {
   if (v == null) return d;
@@ -319,24 +320,38 @@ export async function renameAt(plugin: ArkOSPlugin, oldPath: string, newPath: st
 export function attachWatcher(plugin: ArkOSPlugin) {
   plugin.registerEvent(
     plugin.app.vault.on("create", (f) => {
-      if (f instanceof TFile) void importMarkdownAt(plugin, f).then((ok) => { if (ok) return plugin.savePluginData(); });
+      if (f instanceof TFile) {
+        if (isRagReconcilePath(f.path)) scheduleRagReconcile(plugin, "create");
+        void importMarkdownAt(plugin, f).then((ok) => { if (ok) return plugin.savePluginData(); });
+      }
     }),
   );
   plugin.registerEvent(
     plugin.app.vault.on("modify", (f) => {
-      if (f instanceof TFile) void importMarkdownAt(plugin, f).then((ok) => { if (ok) return plugin.savePluginData(); });
+      if (f instanceof TFile) {
+        if (isRagReconcilePath(f.path)) scheduleRagReconcile(plugin, "modify");
+        void importMarkdownAt(plugin, f).then((ok) => { if (ok) return plugin.savePluginData(); });
+      }
     }),
   );
   plugin.registerEvent(
     plugin.app.vault.on("delete", (f) => {
-      if (f instanceof TFile) void removeAt(plugin, f.path);
+      if (f instanceof TFile) {
+        if (isRagReconcilePath(f.path)) scheduleRagReconcile(plugin, "delete");
+        void removeAt(plugin, f.path);
+      }
     }),
   );
   plugin.registerEvent(
     plugin.app.vault.on("rename", (f, oldPath) => {
-      if (f instanceof TFile) void renameAt(plugin, oldPath, f.path).then(() => importMarkdownAt(plugin, f));
+      if (f instanceof TFile) {
+        if (isRagReconcilePath(oldPath) || isRagReconcilePath(f.path)) scheduleRagReconcile(plugin, "rename");
+        void renameAt(plugin, oldPath, f.path).then(() => importMarkdownAt(plugin, f));
+      }
     }),
   );
+  // attachWatcher 只会执行一次；卸载时同步清理去抖 timer/子进程。
+  plugin.register(() => stopRagReconcile(plugin));
 }
 
 /** 一键开启闭环：建目录 + 全量扫描 + 挂监听 */
@@ -351,6 +366,9 @@ export async function setupSync(plugin: ArkOSPlugin) {
     attachWatcher(plugin);
     (plugin as any)._syncAttached = true;
   }
+  // 插件离线期间的外部编辑无法产生 Vault 事件；启动后做一次 hash 对账兜底。
+  // reconcile 只会为新增/变更/删除及缺失向量入队，不会每日全量调用 embedding。
+  scheduleRagReconcile(plugin, "startup");
   // 就绪时序（§16.3）：首轮全量扫描完成视为就绪，通知 dock 等首页渲染
   (plugin as any)._dataReady = true;
   plugin.app.workspace.trigger("ark:data-ready");

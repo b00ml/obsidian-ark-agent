@@ -6,8 +6,12 @@
 调试:
   npx @modelcontextprotocol/inspector -- .venv\\Scripts\\python.exe obsidian_agent_brain/mcp_server.py
 
-注册 vault / bili / article / inbox / brain / memory / obsidian 七组共 27 个工具，
-薄封装复用既有 bili_summarizer / inbox_collector / 官方 Obsidian CLI，零重写。
+注册 vault / bili / article / inbox / brain / memory 七组 20 个核心规格工具
+（tool_registry.BRAIN_TOOL_SPECS），另显式注册 obsidian_* 5 个与 bili 异步任务
+3 个；tools/list 实测总数以运行时为准（2026-09-12 实测 28）。每个 spec 工具的
+description 末尾带 [contract] 摘要（permission/side_effects/idempotent），
+供客户端程序化读取契约。薄封装复用既有 bili_summarizer / inbox_collector /
+官方 Obsidian CLI，零重写。
 """
 import os
 import sys
@@ -21,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from common import load_config, setup_paths  # noqa: E402
-from tool_registry import BRAIN_TOOL_SPECS  # noqa: E402
+from tool_registry import BRAIN_TOOL_SPECS, spec_contract_line  # noqa: E402
 import tools_article  # noqa: E402
 import tools_bili  # noqa: E402
 import tools_brain  # noqa: E402
@@ -59,9 +63,10 @@ mcp = FastMCP("obsidian-brain")
 
 # ============ 动态注册 brain 工具（vault/bili/article/inbox/brain/memory 六组 21 工具） ============
 def _register_brain_tools(mcp_instance: FastMCP, config: dict) -> None:
-    """从 tool_registry.BRAIN_TOOL_SPECS 动态注册 21 个 brain 工具到 MCP。
+    """从 tool_registry.BRAIN_TOOL_SPECS 动态注册 20 个核心规格工具到 MCP。
 
-    每个工具通过 @mcp.tool() 装饰器注册，函数体直接调用对应 tools_*.py 模块函数。
+    每个工具通过 @mcp.tool() 装饰器注册，函数体直接调用对应 tools_*.py 模块函数；
+    description 末尾附 [contract] 摘要（permission/side_effects/idempotent）。
     """
     # 模块映射：module_suffix → 实际导入的模块对象
     modules = {
@@ -73,10 +78,11 @@ def _register_brain_tools(mcp_instance: FastMCP, config: dict) -> None:
         "memory": tools_memory,
     }
 
-    for tool_name, module_suffix, description, permission, timeout in BRAIN_TOOL_SPECS:
+    for spec in BRAIN_TOOL_SPECS:
+        tool_name, module_suffix = spec.name, spec.module_suffix
         mod = modules.get(module_suffix)
         if mod is None or not hasattr(mod, tool_name):
-            continue  # 跳过未实现函数（如 bili_job_status 设计预留）
+            continue  # 跳过未实现函数（预留 spec），validate_specs 不检查存在性
 
         # 动态构造包装函数：闭包捕获 config 并调用原始工具函数
         fn = getattr(mod, tool_name)
@@ -85,7 +91,6 @@ def _register_brain_tools(mcp_instance: FastMCP, config: dict) -> None:
             def wrapper(*args, **kwargs):
                 return original_fn(cfg, *args, **kwargs)
             wrapper.__name__ = original_fn.__name__
-            wrapper.__doc__ = original_fn.__doc__ or description
             # 保留原函数签名（剔除 config 参数）
             import inspect
             sig = inspect.signature(original_fn)
@@ -94,6 +99,7 @@ def _register_brain_tools(mcp_instance: FastMCP, config: dict) -> None:
             return wrapper
 
         wrapped = make_wrapper(fn, config)
+        wrapped.__doc__ = f"{spec.description} {spec_contract_line(spec)}"
         # 注册到 MCP（FastMCP 的 @mcp.tool() 等价于 mcp.tool()(wrapped)）
         mcp_instance.tool()(wrapped)
 

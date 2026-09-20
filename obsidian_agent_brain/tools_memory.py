@@ -12,9 +12,10 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
-from common import brain_dir
+from common import brain_dir, vault_root
 
 # F5-011: Import Markdown store
 try:
@@ -22,10 +23,31 @@ try:
     agentlab_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agentlab")
     if agentlab_path not in sys.path:
         sys.path.insert(0, agentlab_path)
+    from agentlab.memory.invalidation import DerivedInvalidationCoordinator
     from agentlab.memory.markdown_store import MemoryMarkdownStore
+    from agentlab.rag.index_store import RagIndexStore
     _MARKDOWN_AVAILABLE = True
 except ImportError:
     _MARKDOWN_AVAILABLE = False
+
+
+_RUNTIME_DEPENDENCIES: ContextVar[dict | None] = ContextVar(
+    "memory_runtime_dependencies", default=None
+)
+
+
+def bind_runtime_dependencies(*, range_gateway=None, task_state_store=None,
+                               task_state_id: str = ""):
+    """Bind derived invalidation hooks for one Agent request."""
+    return _RUNTIME_DEPENDENCIES.set({
+        "range_gateway": range_gateway,
+        "task_state_store": task_state_store,
+        "task_state_id": str(task_state_id or ""),
+    })
+
+
+def reset_runtime_dependencies(token) -> None:
+    _RUNTIME_DEPENDENCIES.reset(token)
 
 
 def _memory_home(config: dict) -> str:
@@ -39,15 +61,23 @@ def _db(config: dict) -> str:
 
 
 def _get_markdown_store(config: dict) -> Optional[MemoryMarkdownStore]:
-    """获取 Markdown store 实例（如果可用）。"""
+    """获取 Markdown store 实例（如果可用）。
+
+    OPT-223 根因修复：此前直接 `config.get("vault_root")`——而 agentlab 连接器
+    （load_brain_config）注入的键是 `vault_path`，键名不一致导致 Markdown store
+    永远拿不到，memory_commit 全部静默落 SQLite（Vault 内 sessions.sqlite 积累
+    410 条用户不可见记忆）。统一走 common.vault_root()（注意：该函数只认
+    `vault_path` 键，缺失时显式报错；此处捕获后返回 None 由调用方显式失败）。
+    """
     if not _MARKDOWN_AVAILABLE:
         return None
 
-    vault_root = config.get("vault_root")
-    if not vault_root:
+    try:
+        vault = vault_root(config)
+    except Exception:
         return None
 
-    return MemoryMarkdownStore(vault_root)
+    return MemoryMarkdownStore(vault)
 
 
 @contextmanager
@@ -130,10 +160,27 @@ def _topic_terms(topic: str) -> list[str]:
 
 
 def memory_commit(config: dict, content: str, tags: list[str] | None = None,
-                  source_session: str = "") -> dict:
+                  source_session: str = "", importance: int | None = None,
+                  mem_type: str = "context", bucket: bool = False,
+                  confidence=None, status: str | None = None,
+                  source: str = "user", source_ref: str = "", scope=None,
+                  session_id: str = "", valid_from: str | None = None,
+                  valid_until: str | None = None, subject: str = "",
+                  review_due_at: str | None = None, correction_of: str | None = None,
+                  candidate_first: bool = False,
+                  explicit_confirmation: bool = False) -> dict:
     """沉淀一条可复用记忆（content + tags）。
 
-    F5-011: 优先路由到 Markdown store，失败时回退到 SQLite。
+    F5-011: Markdown 是唯一运行时写入源（用户可在 Obsidian 审阅）。
+    OPT-223: 移除 SQLite 静默回退——此前 Markdown store 拿不到/写入失败时
+    `except: pass` 后落进用户不可见的 sessions.sqlite 并返回 committed，
+    造成"显示成功但 Vault 里没有"的静默数据错位（真实积累 410 条）。
+    现在失败即显式抛错，SQLite 仅保留迁移工具与人工恢复入口。
+    OPT-224: importance（1-10）由 LLM 语义提取传入；None 落默认 5。
+    OPT-225: mem_type 可显式指定（默认 context）；bucket=True 时写入月/项目桶
+    （sessions/2026-09.md 式候选层，Agent 主动调用一般不需要）。
+    OPT-230 B7: confidence（0-1 或 "hypothesis"）落库；**hypothesis 记忆禁止
+    supersedes 已确立结论**（低置信猜测不得替代已确立事实）。
     """
     content = (content or "").strip()
     if not content:
@@ -141,116 +188,291 @@ def memory_commit(config: dict, content: str, tags: list[str] | None = None,
 
     tags = _normalize_tags(tags)
 
-    # F5-011: 尝试 Markdown store
     md_store = _get_markdown_store(config)
-    if md_store:
-        try:
-            # 从 config 推断 project_id（如果存在）
-            project_id = config.get("project_id", "default")
+    if md_store is None:
+        raise ValueError(
+            "MEMORY_MARKDOWN_UNAVAILABLE: Markdown store 不可用（vault_root 未配置"
+            "或 agentlab 包缺失），记忆未写入——SQLite 静默回退已移除（OPT-223）")
 
+    try:
+        # 从 config 推断 project_id（如果存在）
+        project_id = config.get("project_id", "default")
+        bound_project, bound_session = _bound_scope()
+        if bound_project:
+            project_id = bound_project
+        if bound_session and not session_id:
+            session_id = bound_session
+        if bound_session and not source_session:
+            source_session = bound_session
+        policy = config.get("memory_policy") or {}
+        if not candidate_first and policy.get("write_mode") == "candidate_first" \
+                and str(source or "user").lower() not in {"user", "human"}:
+            candidate_first = True
+
+        if bucket:
+            mem_id = md_store.commit_to_bucket(
+                mem_type=mem_type,
+                content=content,
+                tags=tags,
+                project_id=project_id,
+                importance=int(importance) if importance else 3,
+                source_session=source_session,
+                status=status or "active",
+                source=source,
+                source_ref=source_ref,
+                confidence=confidence if confidence is not None else 1.0,
+                candidate_first=candidate_first,
+            )
+        else:
             mem_id = md_store.commit(
                 content=content,
                 tags=tags,
-                mem_type="context",  # 默认为 context，可根据 tags 推断
+                mem_type=mem_type,
                 project_id=project_id,
-                source_session=source_session
+                source_session=source_session,
+                importance=int(importance) if importance else 5,
+                confidence=confidence if confidence is not None else 1.0,
+                status=status,
+                source=source,
+                source_ref=source_ref,
+                scope=scope,
+                session_id=session_id,
+                valid_from=valid_from,
+                valid_until=valid_until,
+                review_due_at=review_due_at,
+                subject=subject,
+                correction_of=correction_of,
+                candidate_first=candidate_first,
+                explicit_confirmation=explicit_confirmation,
             )
-            return {
-                "status": "committed",
-                "id": mem_id,
-                "tags": tags,
-                "storage": "markdown",
-                "created_at": datetime.datetime.now().isoformat(timespec="seconds")
-            }
-        except Exception as e:
-            # 降级到 SQLite
-            pass
+    except Exception as e:
+        raise RuntimeError(
+            f"MEMORY_MARKDOWN_WRITE_FAILED: 记忆未写入（{e}）——"
+            "请检查 Vault 可写性；不回退 SQLite（OPT-223）") from e
 
-    # 回退到 SQLite（保持向后兼容）
-    _ensure_db(config)
-    _ensure_profile(config)
-    now = datetime.datetime.now().isoformat(timespec="seconds")
-    with _connect(config) as conn:
-        cur = conn.execute(
-            "INSERT INTO memories (content, tags, source_session, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (content, ",".join(tags), source_session, now),
-        )
-        mid = cur.lastrowid
-    return {"status": "committed", "id": mid, "tags": tags, "storage": "sqlite", "created_at": now}
+    return {
+        "status": "committed",
+        "id": mem_id,
+        "tags": tags,
+        "storage": "markdown",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds")
+    }
 
 
-def memory_query(config: dict, topic: str, limit: int = 10) -> dict:
+def memory_query(config: dict, topic: str, limit: int = 10,
+                 session_id: str | None = None,
+                 statuses: list[str] | None = None,
+                 include_archive: bool = False,
+                 min_confidence: float | None = None) -> dict:
     """按 topic 召回记忆（多关键词 OR 命中 + 命中数排序，OPT-135）。
-
+    
     F5-011: 优先查询 Markdown store，合并 SQLite 结果（兼容期）。
     """
     topic = (topic or "").strip()
     if not topic or limit <= 0:
         return {"topic": topic, "total": 0, "results": []}
 
-    results = []
-
-    # F5-011: 查询 Markdown store
+    # OPT-223: 只查 Markdown 真源——SQLite 合并已移除（禁止默认静默双源召回）；
+    # 历史数据用 scripts/migrate_memory_to_markdown.py 迁移，SQLite 文件保留为
+    # 人工恢复入口（_connect/_ensure_db 不再被运行时调用）。
     md_store = _get_markdown_store(config)
-    if md_store:
-        try:
-            project_id = config.get("project_id")
-            md_results = md_store.query(topic, limit=limit, project_id=project_id)
+    if md_store is None:
+        raise ValueError(
+            "MEMORY_MARKDOWN_UNAVAILABLE: Markdown store 不可用（vault_root 未配置"
+            "或 agentlab 包缺失），记忆查询终止——SQLite 合并查询已移除（OPT-223）")
+    try:
+        project_id = config.get("project_id")
+        bound_project, bound_session = _bound_scope()
+        if bound_project:
+            project_id = bound_project
+        if bound_session and not session_id:
+            session_id = bound_session
+        policy = config.get("memory_policy") or {}
+        md_results = md_store.query(
+            topic, limit=limit, project_id=project_id,
+            session_id=session_id or config.get("session_id"),
+            statuses=statuses,
+            include_archive=include_archive,
+            min_confidence=(policy.get("recall_min_confidence", 0.0)
+                            if min_confidence is None else min_confidence),
+            allow_default_shared=bool(policy.get("allow_default_shared", True)),
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"MEMORY_MARKDOWN_QUERY_FAILED: 记忆查询失败（{e}）——"
+            "Markdown 真源读取异常，不回退 SQLite（OPT-223）") from e
 
-            # 转换为兼容格式
-            for mem in md_results:
-                results.append({
-                    "id": mem["id"],
-                    "content": mem["content"],
-                    "tags": mem.get("tags", []),
-                    "source_session": mem.get("source_session", ""),
-                    "created_at": mem.get("created_at", ""),
-                    "storage": "markdown"
-                })
-        except Exception as e:
-            pass
+    results = []
+    for mem in md_results:
+        results.append({
+            "id": mem["id"],
+            "content": mem["content"],
+            "tags": mem.get("tags", []),
+            "status": mem.get("status", "active"),
+            "bucket": bool(mem.get("bucket", False)),
+            "project_id": mem.get("project_id", "default"),
+            "scope": mem.get("scope", {}),
+            "confidence": mem.get("confidence", 1.0),
+            "subject": mem.get("subject", ""),
+            "valid_from": mem.get("valid_from", ""),
+            "valid_until": mem.get("valid_until", ""),
+            "source": mem.get("source", "legacy"),
+            "source_ref": mem.get("source_ref", ""),
+            "source_session": mem.get("source_session", ""),
+            "created_at": mem.get("created_at", ""),
+            "storage": "markdown"
+        })
 
-    # 查询 SQLite（兼容期：合并结果）
-    _ensure_db(config)
-    terms = _topic_terms(topic)
-    if terms:
-        where = " OR ".join(["tags LIKE ? OR content LIKE ?"] * len(terms))
-        params = [p for t in terms for p in (f"%{t}%", f"%{t}%")]
-        with _connect(config) as conn:
-            rows = conn.execute(
-                f"SELECT id, content, tags, source_session, created_at "
-                f"FROM memories WHERE {where} ORDER BY id DESC LIMIT ?",
-                (*params, min(limit * 3, 60)),
-            ).fetchall()
+    audit = getattr(md_store, "last_query_audit", None)
+    payload = {"topic": topic, "total": len(results), "results": results}
+    if audit is not None and getattr(audit, "filtered_reasons", None):
+        payload["filtered_reasons"] = dict(audit.filtered_reasons)
+    return payload
 
-        def _hits(r) -> int:
-            text = f"{r[1]},{r[2]}".lower()
-            return sum(1 for t in terms if t.lower() in text)
 
-        rows = sorted(rows, key=lambda r: (-_hits(r), -r[0]))[:limit]
-        for r in rows:
-            results.append({
-                "id": str(r[0]),
-                "content": r[1],
-                "tags": [t for t in r[2].split(",") if t],
-                "source_session": r[3],
-                "created_at": r[4],
-                "storage": "sqlite"
-            })
+def memory_conflicts(config: dict, limit: int = 100,
+                     session_id: str | None = None) -> dict:
+    """List explicit unresolved memory conflicts for human review only."""
+    md_store = _get_markdown_store(config)
+    if md_store is None:
+        raise ValueError("MEMORY_MARKDOWN_UNAVAILABLE: Markdown store 不可用")
+    project_id = config.get("project_id")
+    bound_project, bound_session = _bound_scope()
+    if bound_project:
+        project_id = bound_project
+    if bound_session and not session_id:
+        session_id = bound_session
+    rows = md_store.list_conflicts(project_id=project_id,
+                                   session_id=session_id or config.get("session_id"),
+                                   limit=limit)
+    return {"status": "ok", "total": len(rows), "items": rows}
 
-    # 去重并限制数量
-    seen_content = set()
-    unique_results = []
-    for mem in results:
-        content_key = mem["content"][:100]  # 用前100字符去重
-        if content_key not in seen_content:
-            seen_content.add(content_key)
-            unique_results.append(mem)
-            if len(unique_results) >= limit:
-                break
 
-    return {"topic": topic, "total": len(unique_results), "results": unique_results}
+def _memory_store_action(config: dict, action: str, mem_id: str, **kwargs) -> dict:
+    """Shared wrapper for user correction/revocation/deletion/restore."""
+    md_store = _get_markdown_store(config)
+    if md_store is None:
+        raise ValueError("MEMORY_MARKDOWN_UNAVAILABLE: Markdown store 不可用")
+    try:
+        if action in {"correct", "revoke", "delete"}:
+            index_path = md_store.vault_root / ".agent-brain" / "rag-index-p2.sqlite"
+            rag_index = RagIndexStore(index_path, None, vault_root=md_store.vault_root) \
+                if index_path.exists() else None
+            deps = _RUNTIME_DEPENDENCIES.get() or {}
+            task_store = deps.get("task_state_store")
+            task_id = str(deps.get("task_state_id") or "")
+
+            def invalidate_task_state(*, memory_id: str, source_ref: str = "") -> bool:
+                if task_store is None or not task_id:
+                    return False
+                return bool(task_store.invalidate_memory(
+                    task_id, memory_id=memory_id, source_ref=source_ref))
+
+            coordinator = DerivedInvalidationCoordinator(
+                md_store,
+                rag_index=rag_index,
+                range_gateway=deps.get("range_gateway"),
+                task_state_invalidator=(invalidate_task_state
+                                        if task_store is not None and task_id else None),
+            )
+            if action == "correct":
+                result = coordinator.correct(mem_id, kwargs.pop("content", ""), **kwargs)
+                value = result.derived.get("successor") if result.source_updated else None
+            elif action == "revoke":
+                result = coordinator.revoke(mem_id, **kwargs)
+                value = result.source_updated
+            else:
+                result = coordinator.delete(mem_id, **kwargs)
+                value = result.source_updated
+            return {
+                "status": "ok" if result.complete else "partial",
+                "action": action,
+                "id": mem_id,
+                "result": value,
+                "invalidation": result.to_dict(),
+            }
+        elif action == "restore":
+            value = md_store.restore(mem_id, **kwargs)
+        else:
+            raise ValueError(f"unknown memory action: {action}")
+    except Exception as exc:
+        raise RuntimeError(f"MEMORY_{action.upper()}_FAILED: {exc}") from exc
+    return {"status": "ok" if value else "not_found", "action": action,
+            "id": mem_id, "result": value}
+
+
+def _bound_scope() -> tuple[str, str]:
+    """Read trusted request scope when called from agentlab serve.
+
+    The brain package also runs standalone in tests/MCP, where agentlab may not
+    be importable; in that case an empty scope preserves the legacy behavior.
+    """
+    try:
+        from agentlab.contracts import current_retrieval_scope
+        scope = current_retrieval_scope()
+        return scope.project_id, scope.session_id
+    except Exception:
+        return "", ""
+
+
+def memory_correct(config: dict, mem_id: str, content: str,
+                   tags: list[str] | None = None,
+                   reason: str = "user_correction") -> dict:
+    return _memory_store_action(config, "correct", mem_id, content=content,
+                                tags=tags, reason=reason)
+
+
+def memory_revoke(config: dict, mem_id: str,
+                  reason: str = "user_revoked") -> dict:
+    return _memory_store_action(config, "revoke", mem_id, reason=reason)
+
+
+def memory_delete(config: dict, mem_id: str,
+                  reason: str = "user_delete", hard: bool = True) -> dict:
+    return _memory_store_action(config, "delete", mem_id, reason=reason, hard=hard)
+
+
+def memory_restore(config: dict, mem_id: str,
+                   reason: str = "user_restore") -> dict:
+    return _memory_store_action(config, "restore", mem_id, reason=reason)
+
+
+def memory_review(config: dict, mem_id: str, decision: str, reviewer: str,
+                  expected_content_hash: str, reason: str,
+                  defer_until: str = "") -> dict:
+    """Explicitly confirm or defer a review-due memory.
+
+    The content hash is an optimistic lock from the read-only review queue;
+    stale queue entries fail closed instead of overwriting a newer edit.
+    """
+    md_store = _get_markdown_store(config)
+    if md_store is None:
+        raise ValueError("MEMORY_MARKDOWN_UNAVAILABLE: Markdown store 不可用")
+    try:
+        path = md_store._find_memory_file(mem_id)
+        if path is None:
+            return {"status": "not_found", "action": "review", "id": mem_id}
+        memory = md_store._parse_memory_file(path)
+        project_id = config.get("project_id")
+        bound_project, bound_session = _bound_scope()
+        project_id = bound_project or project_id
+        memory_project = str(memory.get("project_id") or "default")
+        if project_id and memory_project not in {"default", str(project_id)}:
+            raise ValueError("memory review scope denied")
+        memory_session = str(memory.get("session_id") or "")
+        if bound_session and memory_session and memory_session != bound_session:
+            raise ValueError("memory review session scope denied")
+        result = md_store.review(
+            mem_id,
+            decision=decision,
+            reviewer=reviewer,
+            expected_content_hash=expected_content_hash,
+            reason=reason,
+            defer_until=defer_until or None,
+        )
+        return {**result, "status": "ok", "action": "review"}
+    except Exception as exc:
+        raise RuntimeError(f"MEMORY_REVIEW_FAILED: {exc}") from exc
 
 
 def repair_split_tags(config: dict) -> dict:
@@ -258,7 +480,7 @@ def repair_split_tags(config: dict) -> dict:
 
     判据：按 ',' 拆分后非空片段 ≥2 且 ≥70% 为单字符（正常 tag 词几乎不可能全单字）；
     重组时空片段即原串中被拆开的 ',' 字符本身。返回 {scanned, fixed:[{id,old,new}]}。
-
+    
     注：仅适用于 SQLite 旧库，Markdown store 已在 commit 时修复。
     """
     _ensure_db(config)

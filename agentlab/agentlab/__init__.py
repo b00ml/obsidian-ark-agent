@@ -15,6 +15,39 @@ from agentlab.core.agent import Agent
 from agentlab.core.loop import AgentResult, Runner
 from agentlab.core.llm import LLMProvider, LLMResponse, OpenAICompatProvider
 from agentlab.tools.base import Tool, ExecutionMode, ToolPermission, tool
+from agentlab.contracts import (
+    CONTRACT_VERSION,
+    Artifact,
+    Citation,
+    CitationStatus,
+    ProcessAttempt,
+    ProcessStatus,
+    Project,
+    Provenance,
+    RequestScope,
+    RetrievalItem,
+    RetrievalResult,
+    RetrievalScope,
+    RetrievalStatus,
+    RetrievalStrategy,
+    bind_retrieval_scope,
+    current_retrieval_scope,
+    reset_retrieval_scope,
+    Session,
+    Source,
+    SourceDocument,
+    StageResult,
+)
+from agentlab.runtime.task_state import (
+    TaskState,
+    TaskStateConflict,
+    TaskStateError,
+    TaskStateStore,
+)
+from agentlab.runtime.stages import StageTracker
+from agentlab.core.planning import Plan, PlanBuilder, PlanExecutor, PlanStep
+from agentlab.memory.invalidation import InvalidationResult, DerivedInvalidationCoordinator
+from agentlab.rag.citations import CitationRegistry
 
 __all__ = [
     "Message",
@@ -33,6 +66,39 @@ __all__ = [
     "ExecutionMode",
     "ToolPermission",
     "tool",
+    "CONTRACT_VERSION",
+    "Project",
+    "Source",
+    "SourceDocument",
+    "Session",
+    "Artifact",
+    "ProcessAttempt",
+    "ProcessStatus",
+    "StageResult",
+    "Citation",
+    "CitationStatus",
+    "Provenance",
+    "RequestScope",
+    "RetrievalItem",
+    "RetrievalResult",
+    "RetrievalScope",
+    "RetrievalStatus",
+    "RetrievalStrategy",
+    "current_retrieval_scope",
+    "bind_retrieval_scope",
+    "reset_retrieval_scope",
+    "TaskState",
+    "TaskStateError",
+    "TaskStateConflict",
+    "TaskStateStore",
+    "StageTracker",
+    "Plan",
+    "PlanStep",
+    "PlanBuilder",
+    "PlanExecutor",
+    "InvalidationResult",
+    "DerivedInvalidationCoordinator",
+    "CitationRegistry",
 ]
 
 __version__ = "0.1.0"

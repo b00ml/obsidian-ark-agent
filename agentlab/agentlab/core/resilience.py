@@ -14,10 +14,13 @@ from typing import Any, Awaitable, Callable
 
 from agentlab.core.errors import AgentError
 from agentlab.core.llm import LLMProvider
+from agentlab.core.run_contract import current_run_budget
 
 log = logging.getLogger("agentlab.resilience")
 
-RETRYABLE_CODES = {"AGENT_LLM_RATE", "AGENT_LLM_TIMEOUT", "AGENT_LLM_AUTH"}
+# Authentication/configuration failures are deterministic and must never be
+# retried; retry only transport, timeout and provider throttling failures.
+RETRYABLE_CODES = {"AGENT_LLM_RATE", "AGENT_LLM_TIMEOUT"}
 
 
 class CircuitBreaker:
@@ -85,6 +88,12 @@ class ResilientLLM(LLMProvider):
         self.backoff = backoff
         self.retryable = retryable_codes or RETRYABLE_CODES
 
+    async def aclose(self) -> None:
+        """Forward lifecycle cleanup to a provider that owns a connection pool."""
+        closer = getattr(self.inner, "aclose", None)
+        if closer is not None:
+            await closer()
+
     async def chat(
         self,
         messages: list,
@@ -101,12 +110,18 @@ class ResilientLLM(LLMProvider):
             )
         last_err: AgentError | None = None
         for attempt in range(self.max_retries + 1):
+            budget = current_run_budget()
+            if budget is not None and budget.expired():
+                budget.stop_reason = "deadline"
+                raise AgentError("AGENT_LLM_TIMEOUT", "LLM 调用超过本次请求截止时间")
             try:
-                resp = await self.inner.chat(
+                pending = self.inner.chat(
                     messages, tools,
                     temperature=temperature, max_tokens=max_tokens,
                     stream=stream, on_stream=on_stream,
                 )
+                remaining = budget.remaining() if budget is not None else None
+                resp = await asyncio.wait_for(pending, timeout=remaining) if remaining else await pending
                 self.breaker.on_success()
                 return resp
             except AgentError as e:
@@ -117,12 +132,30 @@ class ResilientLLM(LLMProvider):
                 self.breaker.on_failure()
                 if attempt < self.max_retries:
                     delay = self.backoff * (2 ** attempt)
+                    if budget is not None and not budget.admit_retry():
+                        break
+                    if budget is not None and budget.remaining() is not None and delay > budget.remaining():
+                        budget.stop_reason = "deadline"
+                        break
                     log.warning("LLM 重试 %s/%s（%s），%ss 后重试",
                                 attempt + 1, self.max_retries, e.code, delay)
                     await asyncio.sleep(delay)
-            except Exception as e:  # 非 AgentError 一律视为可重试瞬时错误
-                last_err = AgentError("AGENT_LLM_TIMEOUT", f"LLM 异常：{e}")
+            except (asyncio.TimeoutError, OSError, ConnectionError) as e:
+                # Only transport failures are retryable here.  Provider
+                # response/schema errors must fail closed without another
+                # paid request.
+                last_err = AgentError("AGENT_LLM_TIMEOUT", f"LLM 网络异常：{e}")
                 self.breaker.on_failure()
                 if attempt < self.max_retries:
-                    await asyncio.sleep(self.backoff * (2 ** attempt))
+                    if budget is not None and not budget.admit_retry():
+                        break
+                    delay = self.backoff * (2 ** attempt)
+                    if budget is not None and budget.remaining() is not None and delay > budget.remaining():
+                        budget.stop_reason = "deadline"
+                        break
+                    await asyncio.sleep(delay)
+            except Exception as e:
+                last_err = AgentError("AGENT_LLM_PROVIDER", f"LLM provider 异常：{e}")
+                self.breaker.on_failure()
+                raise last_err from e
         raise last_err if last_err is not None else AgentError("AGENT_LLM_TIMEOUT", "LLM 未知故障")

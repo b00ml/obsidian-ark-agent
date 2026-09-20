@@ -16,13 +16,16 @@ def vault_read(config: dict, path: str) -> str:
     return read_note(config, path)
 
 
-def vault_write(config: dict, path: str, content: str) -> dict:
+def vault_write(config: dict, path: str, content: str,
+                expected_revision: str | None = None) -> dict:
     """写入/覆盖 Vault 笔记。
 
     path 为 Vault 相对路径；裸文件名（不含 /）默认写入 Inbox/。
     raw/ 只读拒绝；父目录自动创建。
+    expected_revision 传入时做 CAS 冲突检测：与磁盘当前 revision 不符则拒绝
+    覆盖（VaultConflictError），revision 取上次 vault_write/vault_patch 返回值。
     """
-    return VaultGateway(config).write(path, content)
+    return VaultGateway(config).write(path, content, expected_revision=expected_revision)
 
 
 def vault_patch(config: dict, path: str, old: str, new: str,

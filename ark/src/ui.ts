@@ -62,9 +62,9 @@ export function conflictDialog(plugin: ArkOSPlugin, message: string): Promise<"r
     const modal = new Modal(plugin.app);
     modal.titleEl.setText("写入冲突");
     modal.contentEl.createDiv({ cls: "sos-hint", text: message });
-    modal.contentEl.createDiv({
-      cls: "sos-hint",
-      text: "可能的原因：其他窗口正在修改此会话，或并发执行了多个 Agent 任务。"
+    modal.contentEl.createDiv({ 
+      cls: "sos-hint", 
+      text: "可能的原因：其他窗口正在修改此会话，或并发执行了多个 Agent 任务。" 
     });
     new Setting(modal.contentEl)
       .addButton((b) => b.setButtonText("取消").onClick(() => { modal.close(); resolve("cancel"); }))

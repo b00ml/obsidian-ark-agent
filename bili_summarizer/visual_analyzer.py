@@ -18,6 +18,7 @@ import sys
 import requests
 
 from prompt_loader import load_prompt, render
+from provider_client import ProviderError, TextModelClient
 
 # 配置文件默认路径（相对本文件）
 DEFAULT_CONFIG_PATH = os.path.join(
@@ -37,56 +38,23 @@ def load_visual_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
 
 
 def _chat_completion(config: dict, messages: list, max_tokens: int,
-                     timeout: int, image_b64: str | None = None) -> dict:
+                     timeout: int, image_b64: str | None = None,
+                     client: TextModelClient | None = None) -> dict:
     """统一的 chat/completions 调用（支持可选的图片输入）
 
     config: {"api_base", "api_key", "model"}
     返回: {"content", "model", "usage"}
     """
-    if not config.get("api_key") or config["api_key"].startswith("sk-xxx"):
-        raise RuntimeError(
-            f"未配置有效的 API Key (model={config.get('model')})。\n"
-            f"请编辑 {DEFAULT_CONFIG_PATH} 填写 api_key。"
-        )
-
-    content = [{"type": "text", "text": messages[0]["content"]}]
-    if image_b64:
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{image_b64}",
-                "detail": config.get("detail", "high"),
-            },
-        })
-
-    payload = {
-        "model": config["model"],
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": max_tokens,
-    }
-
-    response = requests.post(
-        f"{config['api_base'].rstrip('/')}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {config['api_key']}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=timeout,
+    model_client = client or TextModelClient(
+        api_base=config["api_base"], api_key=config.get("api_key", ""),
+        model=config["model"], timeout=timeout, transport=requests.post,
     )
-    response.raise_for_status()
-    result = response.json()
-
     try:
-        content_text = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        raise RuntimeError(f"视觉模型返回异常: {result}") from e
-
-    return {
-        "content": content_text,
-        "model": config.get("model"),
-        "usage": result.get("usage", {}),
-    }
+        return model_client.chat(messages[0]["content"], max_tokens=max_tokens,
+                                 image_b64=image_b64,
+                                 detail=config.get("detail", "high")).to_dict()
+    except ProviderError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def analyze_with_visual(transcript: str, grid_image_b64: str,

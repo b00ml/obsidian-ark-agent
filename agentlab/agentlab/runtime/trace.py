@@ -13,12 +13,18 @@ from agentlab.core.message import Message
 _HEADER_RE = re.compile(r"(?i)(authorization|api-key|x-api-key)[\"':=]+\s*([^\s\",}]+)")
 _TOKEN_RE = re.compile(r"(?i)(sk-[a-z0-9-_]+)")
 _BEARER_RE = re.compile(r"(?i)(bearer|key)\s+([a-z0-9._-]{8,})")
+# JSON/查询串键值形态："api_key": "v"、cookie= v、password:v 等（P0-06 脱敏测试覆盖）
+# 键值间分隔符含 JSON 转义引号（\"），字符类须放过反斜杠
+_KV_RE = re.compile(
+    r"(?i)((?:api[_-]?key|access[_-]?token|token|cookie|password|secret)\s*[\\\"':=\s]+)"
+    r"([A-Za-z0-9._+/=-]{8,})")
 
 
 def _redact_str(s: str) -> str:
     s = _HEADER_RE.sub(r"\1: [REDACTED]", s)
     s = _TOKEN_RE.sub("[REDACTED]", s)
     s = _BEARER_RE.sub(r"\1 [REDACTED]", s)
+    s = _KV_RE.sub(r"\1[REDACTED]", s)
     return s
 
 
@@ -115,6 +121,12 @@ def load_run_summaries(trace_dir: str | Path, limit: int = 20) -> list[dict]:
                         tools += 1
             if run_rec is None:
                 continue
+            # New serve runs persist semantic counters in the run record.
+            # Older traces only have per-event aggregates, so retain that
+            # fallback for backward-compatible summaries.
+            run_steps = run_rec.get("steps")
+            run_llm_calls = run_rec.get("llm_calls")
+            run_tool_calls = run_rec.get("tool_calls")
             tokens = run_rec.get("tokens")
             if tokens is None and isinstance(last_usage, dict):
                 tokens = (last_usage.get("input_tokens") or 0) \
@@ -128,8 +140,13 @@ def load_run_summaries(trace_dir: str | Path, limit: int = 20) -> list[dict]:
                 "input": run_rec.get("input", ""),
                 "stop_reason": run_rec.get("stop_reason") or stop,
                 "tokens": tokens,
-                "steps": steps,
-                "tools": tools,
+                "steps": int(run_steps) if run_steps is not None else steps,
+                "tools": int(run_tool_calls) if run_tool_calls is not None else tools,
+                "rounds": int(run_rec.get("rounds", run_steps or steps) or 0),
+                "llm_calls": int(run_llm_calls) if run_llm_calls is not None else steps,
+                "tool_calls": int(run_tool_calls) if run_tool_calls is not None else tools,
+                "retries": int(run_rec.get("retries", 0) or 0),
+                "plan_steps": int(run_rec.get("plan_steps", 0) or 0),
                 "error": run_rec.get("error", ""),
                 "cancel_reason": run_rec.get("cancel_reason", ""),
             })

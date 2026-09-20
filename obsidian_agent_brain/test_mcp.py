@@ -3,7 +3,7 @@
 运行:
   .venv\\Scripts\\python.exe -m unittest obsidian_agent_brain/test_mcp.py
 
-写操作全部落在测试临时 Vault 目录，不污染用户数据。
+写操作全部落在临时 Vault 目录，不污染真实 E:/peik1_books。
 """
 import json
 import os
@@ -42,7 +42,7 @@ def make_config(tmp_vault: str) -> dict:
 
 
 def fresh_vault() -> str:
-    """重建固定临时 Vault 目录并返回路径。"""
+    """重建固定临时 Vault 目录并返回路径（不污染真实 E:/peik1_books）。"""
     shutil.rmtree(TEST_VAULT, ignore_errors=True)
     os.makedirs(TEST_VAULT, exist_ok=True)
     return TEST_VAULT
@@ -115,6 +115,49 @@ class VaultToolsTest(unittest.TestCase):
         self.assertTrue(os.path.exists(audit))
         with open(audit, encoding="utf-8") as fh:
             self.assertIn(first["revision"], fh.read())
+
+
+    def test_vault_search_excludes_memory_archive(self):
+        """OPT-227 A2：归档区默认不可召回（vault_search/scan 等全走 list_notes）。"""
+        archive_dir = os.path.join(self.vault, "ark", "memory", "archive", "2026")
+        os.makedirs(archive_dir, exist_ok=True)
+        with open(os.path.join(archive_dir, "mem-archived.md"), "w", encoding="utf-8") as f:
+            f.write("---\nid: mem-archived\ntype: sessions\nstatus: archived\n---\n\n归档区独有内容：量子褶皱引擎")
+        with open(os.path.join(self.vault, "Inbox", "正常笔记.md"), "w", encoding="utf-8") as f:
+            f.write("正常笔记：关于量子物理的入门")
+        r = tools_vault.vault_search(self.cfg, "量子")
+        paths = [h["path"] for h in r["results"]]
+        self.assertTrue(all("ark/memory/archive" not in pth for pth in paths),
+                        f"归档内容不应被召回: {paths}")
+        self.assertTrue(any("正常笔记" in pth for pth in paths))
+
+    def test_conflict_attempt_leaves_audit_event(self):
+        # P0-06：CAS 冲突也是必须可追查的副作用尝试——audit 有 result=conflict 事件
+        from vault_gateway import VaultConflictError
+        tools_vault.vault_write(self.cfg, "Inbox/c.md", "v1")
+        before = self._audit_lines()
+        with self.assertRaises(VaultConflictError):
+            tools_vault.VaultGateway(self.cfg).write("Inbox/c.md", "v2",
+                                                     expected_revision="stale")
+        new_lines = self._audit_lines()[len(before):]
+        self.assertTrue(any('"result":"conflict"' in ln or '"result": "conflict"' in ln
+                            for ln in new_lines), f"冲突未留审计: {new_lines}")
+
+    def test_audit_failure_does_not_falsify_success(self):
+        # P0-06：审计写失败不得假报成功——返回值带 warning（结果未核实），写入本身成功
+        from vault_gateway import VaultGateway, _audit
+        tools_vault.vault_write(self.cfg, "Inbox/d.md", "v1")
+        with patch("vault_gateway._audit", return_value=False):
+            out = VaultGateway(self.cfg).write("Inbox/d.md", "v2")
+        self.assertEqual(out["status"], "written")
+        self.assertEqual(out["warning"], "audit_write_failed_result_unverified")
+
+    def _audit_lines(self) -> list[str]:
+        audit = os.path.join(self.vault, ".agent-brain", "audit", "vault.jsonl")
+        if not os.path.exists(audit):
+            return []
+        with open(audit, encoding="utf-8") as fh:
+            return fh.read().splitlines()
 
     def test_patch_returns_revision_and_honors_cas(self):
         from vault_gateway import VaultConflictError
@@ -217,6 +260,185 @@ class MemoryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             tools_memory.memory_commit(self.cfg, "  ")
 
+
+
+    def test_importance_persists_to_frontmatter(self):
+        """OPT-224：importance 由 LLM 提取传入并持久化（此前被丢弃、全部落默认 5）。"""
+        tools_memory.memory_commit(self.cfg, "高价值经验", tags=["imp"], importance=8)
+        import glob as _glob
+        md_files = _glob.glob(self.vault + "/ark/memory/**/*.md", recursive=True)
+        target = [f for f in md_files if "高价值经验" in open(f, encoding="utf-8").read()]
+        self.assertTrue(target, "未找到写入的记忆文件")
+        self.assertIn("importance: 8", open(target[0], encoding="utf-8").read())
+
+    def test_project_isolation_with_default_shared(self):
+        """OPT-224：project_id 隔离——default 为跨项目共享层。"""
+        tools_memory.memory_commit({**self.cfg, "project_id": "proj-a"},
+                                   "项目A专属记忆", tags=["pa"])
+        tools_memory.memory_commit(self.cfg, "全局共享记忆", tags=["shared"])
+        qa = tools_memory.memory_query({**self.cfg, "project_id": "proj-a"}, "记忆", limit=10)
+        contents = [r["content"] for r in qa["results"]]
+        self.assertIn("项目A专属记忆", contents)
+        self.assertIn("全局共享记忆", contents)  # default 共享层可见
+        qb = tools_memory.memory_query({**self.cfg, "project_id": "proj-b"}, "记忆", limit=10)
+        contents_b = [r["content"] for r in qb["results"]]
+        self.assertNotIn("项目A专属记忆", contents_b)
+        self.assertIn("全局共享记忆", contents_b)
+
+    def test_markdown_failure_fails_loudly_no_sqlite_fallback(self):
+        """OPT-223 故障注入：Markdown 写入失败必须显式抛错，禁止静默回退写 SQLite。
+
+        真实根因（C4-A）：键名不一致（vault_path vs vault_root）令 Markdown store
+        永远不可用，memory_commit 静默落 SQLite 积累 410 条用户不可见记忆。
+        """
+        tools_memory.memory_commit(self.cfg, "基线记忆", tags=["m0"])
+        from agentlab.memory.markdown_store import MemoryMarkdownStore
+        with patch.object(MemoryMarkdownStore, "commit", side_effect=OSError("disk full")):
+            with self.assertRaises(RuntimeError) as ctx:
+                tools_memory.memory_commit(self.cfg, "失败期间的记忆", tags=["m1"])
+        self.assertIn("MEMORY_MARKDOWN_WRITE_FAILED", str(ctx.exception))
+        # SQLite 不产生任何回退行（表甚至不会被创建——运行时不再触碰 SQLite）
+        import sqlite3 as _s3
+        try:
+            with tools_memory._connect(self.cfg) as conn:
+                n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        except _s3.OperationalError:
+            n = 0  # 表不存在 = 无回退写入
+        self.assertEqual(n, 0, "Markdown 失败时不得静默写 SQLite")
+        # 失败期间的记忆在 Markdown 中不存在（不伪造成功）
+        q = tools_memory.memory_query(self.cfg, "失败期间")
+        self.assertEqual(q["total"], 0)
+
+    def test_query_reads_markdown_only_no_sqlite_merge(self):
+        """OPT-223：SQLite 里的历史行不得再被默认召回（禁止静默双源合并）。"""
+        tools_memory._ensure_db(self.cfg)
+        with tools_memory._connect(self.cfg) as conn:
+            conn.execute(
+                "INSERT INTO memories (content, tags, source_session, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("只在 SQLite 里的旧记忆", "legacy", "", "2025-01-01T00:00:00"))
+        q = tools_memory.memory_query(self.cfg, "SQLite 旧记忆")
+        self.assertEqual(q["total"], 0)
+        self.assertTrue(all(r["storage"] == "markdown" for r in q["results"]))
+
+    def test_memory_correction_revocation_and_delete_lifecycle(self):
+        """S1：用户可纠错，旧版本立即从默认查询消失，动作可重试。"""
+        first = tools_memory.memory_commit(self.cfg, "旧项目结论", tags=["结论"])
+        corrected = tools_memory.memory_correct(self.cfg, first["id"], "新项目结论",
+                                                reason="用户纠正")
+        self.assertEqual(corrected["status"], "ok")
+        q = tools_memory.memory_query(self.cfg, "项目结论", limit=10)
+        self.assertNotIn(first["id"], [row["id"] for row in q["results"]])
+        self.assertIn(corrected["result"], [row["id"] for row in q["results"]])
+        self.assertEqual(tools_memory.memory_revoke(self.cfg, corrected["result"])["status"], "ok")
+        self.assertEqual(tools_memory.memory_revoke(self.cfg, corrected["result"])["status"], "ok")
+        self.assertEqual(tools_memory.memory_delete(self.cfg, corrected["result"])["status"], "ok")
+
+    def test_memory_revoke_invalidates_active_p2_index(self):
+        """P2-01：纠错入口必须同步清理当前 P2 派生索引。"""
+        from agentlab.rag.index_store import RagIndexStore
+
+        committed = tools_memory.memory_commit(self.cfg, "待撤销的派生索引事实", tags=["p2"])
+        index = RagIndexStore(
+            os.path.join(self.vault, ".agent-brain", "rag-index-p2.sqlite"),
+            None,
+            vault_root=self.vault,
+        )
+        index.sync_vault(self.vault)
+        self.assertTrue(index.search_lexical("待撤销的派生索引事实"))
+
+        revoked = tools_memory.memory_revoke(self.cfg, committed["id"])
+        self.assertEqual(revoked["status"], "ok")
+        self.assertEqual(revoked["invalidation"]["derived"]["rag_index"], "invalidated")
+        self.assertFalse(index.search_lexical("待撤销的派生索引事实"))
+
+    def test_memory_revoke_invalidates_bound_session_and_task_state(self):
+        """P2-01：serve 绑定的 range/task 派生路由随生命周期动作清理。"""
+        from agentlab.memory.ranges import RangeArchive, RangeGateway
+        from agentlab.runtime.task_state import TaskStateStore
+
+        committed = tools_memory.memory_commit(
+            self.cfg, "绑定会话的旧事实", source_session="session-memory",
+        )
+        ranges = RangeArchive(os.path.join(self.vault, "sessions"))
+        range_path = ranges.path("session-memory")
+        range_path.parent.mkdir(parents=True, exist_ok=True)
+        range_path.write_text("old range\n", encoding="utf-8")
+        gateway = RangeGateway(ranges)
+        task_store = TaskStateStore(os.path.join(self.vault, "task-state.db"))
+        task_store.ensure("task-memory")
+        task_store.patch(
+            "task-memory",
+            {"context_snapshot": {"memory_id": committed["id"], "source_ref": "old.md"}},
+        )
+        token = tools_memory.bind_runtime_dependencies(
+            range_gateway=gateway, task_state_store=task_store,
+            task_state_id="task-memory",
+        )
+        try:
+            revoked = tools_memory.memory_revoke(self.cfg, committed["id"])
+        finally:
+            tools_memory.reset_runtime_dependencies(token)
+        self.assertEqual(revoked["status"], "ok")
+        self.assertEqual(revoked["invalidation"]["derived"]["session_range"], "invalidated")
+        self.assertEqual(revoked["invalidation"]["derived"]["task_state"], "invalidated")
+        self.assertFalse(range_path.exists())
+        checkpoint = task_store.get("task-memory")
+        self.assertNotIn(committed["id"], str(checkpoint.core_intent))
+        self.assertIn(committed["id"], checkpoint.context_snapshot["invalidated_memory_refs"])
+
+    def test_memory_candidate_and_scope_filters(self):
+        """S1：候选默认不注入，跨项目记录不泄漏。"""
+        candidate = tools_memory.memory_commit(
+            {**self.cfg, "project_id": "project-a"}, "待审核项目事实",
+            source="assistant", candidate_first=True,
+        )
+        tools_memory.memory_commit({**self.cfg, "project_id": "project-b"}, "项目B事实")
+        qa = tools_memory.memory_query({**self.cfg, "project_id": "project-a"}, "项目", limit=10)
+        self.assertNotIn(candidate["id"], [row["id"] for row in qa["results"]])
+        self.assertNotIn("项目B事实", [row["content"] for row in qa["results"]])
+
+    def test_memory_review_requires_hash_and_is_explicit(self):
+        from agentlab.memory.markdown_store import MemoryMarkdownStore
+        from datetime import datetime, timedelta, timezone
+
+        due = tools_memory.memory_commit(
+            self.cfg, "待人工确认的事实", source="assistant",
+            review_due_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        )
+        store = MemoryMarkdownStore(self.vault, create_dirs=False)
+        memory = store._parse_memory_file(store._find_memory_file(due["id"]))
+        reviewed = tools_memory.memory_review(
+            self.cfg, due["id"], "confirm", "alice", memory["content_hash"], "人工核对通过",
+        )
+        self.assertEqual(reviewed["status"], "ok")
+        self.assertEqual(store.get(due["id"])["review_due_at"], "")
+        with self.assertRaises(RuntimeError):
+            tools_memory.memory_review(
+                self.cfg, due["id"], "confirm", "alice", "0" * 64, "陈旧清单",
+            )
+
+    def test_memory_conflicts_are_metadata_only_and_not_queryable_by_default(self):
+        first = tools_memory.memory_commit(
+            self.cfg, "项目采用 SQLite", mem_type="decisions",
+            source="user", subject="storage-engine")
+        conflicting = tools_memory.memory_commit(
+            self.cfg, "项目采用 PostgreSQL", mem_type="decisions",
+            source="user", subject="storage-engine")
+        rows = tools_memory.memory_conflicts(self.cfg)
+        self.assertEqual(rows["total"], 1)
+        self.assertEqual(rows["items"][0]["id"], conflicting["id"])
+        self.assertEqual(rows["items"][0]["conflicts_with"], [first["id"]])
+        default = tools_memory.memory_query(self.cfg, "项目采用")
+        self.assertNotIn(conflicting["id"], {row["id"] for row in default["results"]})
+
+    def test_vault_path_key_resolves_markdown_store(self):
+        """OPT-223 根因回归：agentlab 注入的 vault_path 键也必须能拿到 Markdown store。"""
+        cfg = {"vault_path": self.vault}
+        self.assertIsNotNone(tools_memory._get_markdown_store(cfg))
+        r = tools_memory.memory_commit(cfg, "键名回归记忆", tags=["k"])
+        self.assertEqual(r["storage"], "markdown")
+
     def test_missing_vault_path_rejected_instead_of_writing_to_cwd(self):
         """cfg 缺 vault_path 时必须报错，不能把 cwd 当 Vault。
 
@@ -258,6 +480,106 @@ class BiliErrorPathTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             bili_transcribe(cfg, "不是BV号")
 
+    def test_transcribe_returns_serialized_pipeline_stages(self):
+        import types
+        from tools_bili import bili_transcribe
+        cfg = load_config()
+        fake = types.SimpleNamespace(extract_bvid=lambda value: value)
+        with patch("tools_bili._import_bili", return_value=fake), \
+             patch("tools_bili._run_in_bili", side_effect=[
+                 ("标题", "字幕", 1, {"SESSDATA": "local"}),
+                 {"title": "标题"},
+             ]):
+            result = bili_transcribe(cfg, "BV1xx411x7xx")
+        self.assertEqual(result["title"], "标题")
+        self.assertEqual(
+            [row["status"] for row in result["stages"]],
+            ["accepted", "fetched", "parsed", "enriched", "completed"],
+        )
+
+
+class ArticleStageTest(unittest.TestCase):
+    def test_fetch_returns_serialized_pipeline_stages(self):
+        import types
+        from tools_article import article_fetch
+        cfg = load_config()
+        fake = types.SimpleNamespace(
+            fetch_article=lambda _: "<html />",
+            extract_article=lambda _: {"title": "文章", "author": "作者", "content": "正文"},
+        )
+        with patch("tools_article._import_article", return_value=fake):
+            result = article_fetch(cfg, "https://mp.weixin.qq.com/s/example")
+        self.assertEqual(result["content_len"], 2)
+        self.assertEqual(
+            [row["status"] for row in result["stages"]],
+            ["accepted", "fetched", "parsed", "completed"],
+        )
+
+
+class ToolContractTest(unittest.TestCase):
+    """OPT-212 P0-03 最小 Tool Contract：规格校验、防漂移、vault_write CAS 工具面。"""
+
+    def test_specs_validate_clean(self):
+        from tool_registry import BRAIN_TOOL_SPECS, validate_specs
+        errs = validate_specs(BRAIN_TOOL_SPECS)
+        self.assertEqual(errs, [], f"工具契约违规: {errs}")
+
+    def test_write_tools_fully_declared(self):
+        from tool_registry import BRAIN_TOOL_SPECS
+        write = [s for s in BRAIN_TOOL_SPECS if s.permission == "write"]
+        self.assertGreaterEqual(len(write), 6)
+        for s in write:
+            self.assertTrue(s.side_effects, f"{s.name} 缺 side_effects")
+            self.assertIsNotNone(s.idempotent, f"{s.name} 缺 idempotent")
+
+    def test_read_tools_with_hidden_side_effects_marked(self):
+        from tool_registry import BRAIN_TOOL_SPECS
+        by_name = {s.name: s for s in BRAIN_TOOL_SPECS}
+        self.assertEqual(by_name["brain_reindex"].permission, "write")
+        self.assertEqual(by_name["inbox_collect"].permission, "write")
+        self.assertEqual(by_name["brain_reindex"].side_effects, "index")
+        self.assertEqual(by_name["inbox_collect"].side_effects, "write")
+
+    def test_spec_functions_exist_no_drift(self):
+        # 防 spec 漂移：除预留（未实现）外，每条 spec 的函数必须在对应模块存在
+        import importlib
+        from tool_registry import BRAIN_TOOL_SPECS, validate_specs
+        import tools_article, tools_bili, tools_brain, tools_inbox  # noqa: F401
+        import tools_memory, tools_vault
+        mods = {"vault": tools_vault, "brain": tools_brain, "memory": tools_memory,
+                "bili": tools_bili, "article": tools_article, "inbox": tools_inbox}
+        reserved = {"brain_reindex"}  # 预留工具：spec 有、函数无（test_reindex_placeholder_not_enabled 已锁语义）
+        missing = [s.name for s in BRAIN_TOOL_SPECS
+                   if s.name not in reserved and not hasattr(mods[s.module_suffix], s.name)]
+        self.assertEqual(missing, [], f"spec 声明但模块缺少函数: {missing}")
+        self.assertEqual(validate_specs(BRAIN_TOOL_SPECS), [])
+
+    def test_vault_write_cas_via_tool_surface(self):
+        # CAS 能力此前只在 Gateway 层，工具签名未暴露 → Agent 无法冲突安全写
+        from vault_gateway import VaultConflictError
+        vault = fresh_vault()
+        cfg = make_config(vault)
+        first = tools_vault.vault_write(cfg, "Inbox/cas.md", "v1")
+        self.assertEqual(first["status"], "written")
+        second = tools_vault.vault_write(cfg, "Inbox/cas.md", "v2",
+                                         expected_revision=first["revision"])
+        self.assertNotEqual(second["revision"], first["revision"])
+        with self.assertRaises(VaultConflictError):
+            tools_vault.vault_write(cfg, "Inbox/cas.md", "v3",
+                                    expected_revision=first["revision"])  # 旧 revision
+        self.assertEqual(tools_vault.vault_read(cfg, "Inbox/cas.md"), "v2")
+
+    def test_registered_descriptions_carry_contract_line(self):
+        import mcp_server
+        from tool_registry import BRAIN_TOOL_SPECS
+        tools = {t.name: t for t in mcp_server.mcp._tool_manager.list_tools()}
+        for spec in BRAIN_TOOL_SPECS:
+            t = tools.get(spec.name)
+            if t is None:
+                continue  # 预留未实现
+            self.assertIn("[contract]", t.description, f"{spec.name} description 缺契约摘要")
+            self.assertIn(f"permission={spec.permission}", t.description)
+
 
 class ServerRegistrationTest(unittest.TestCase):
     def test_tool_count_ge_10(self):
@@ -271,7 +593,9 @@ class ServerRegistrationTest(unittest.TestCase):
                          "bili_screenshot", "bili_visual", "article_fetch",
                          "article_summarize", "inbox_collect", "inbox_read_queue",
                          "brain_search", "brain_reindex", "brain_scan",
-                         "memory_commit", "memory_query",
+                         "memory_commit", "memory_query", "memory_correct",
+                         "memory_revoke", "memory_delete", "memory_restore",
+                         "memory_review",
                          "obsidian_links", "obsidian_health", "obsidian_rename",
                          "obsidian_move", "obsidian_property_set"):
             self.assertIn(required, names, f"缺少工具 {required}")
@@ -446,7 +770,7 @@ class ObsidianCliToolsTest(unittest.TestCase):
     """Obsidian CLI 接入（优化设计文档4.0 执行线 #3）：探测 + 优雅降级 + 白名单。
 
     全程 mock shutil.which / subprocess.run，不依赖真实 Obsidian 安装；
-    写操作参数校验落在临时 Vault 路径字符串上，不碰用户 Vault。
+    写操作参数校验落在临时 Vault 路径字符串上，不碰真实 E:/peik1_books。
     """
 
     def setUp(self):
@@ -638,7 +962,9 @@ class MemoryTagsAndRecallTest(unittest.TestCase):
         self.assertTrue(any("诗句" in r["content"] for r in q["results"]))
 
     def test_repair_split_tags_fixes_corrupted_rows(self):
-        tools_memory.memory_commit(self.cfg, "正常记忆", tags=["rag", "检索"])
+        # OPT-223：repair_split_tags 是 SQLite 旧库的人工修复入口（服务于迁移场景），
+        # 与运行时 memory_query（只查 Markdown）解耦——修复结果直接查 SQLite 验证
+        tools_memory._ensure_db(self.cfg)
         with tools_memory._connect(self.cfg) as conn:  # 种一行旧 bug 产物
             conn.execute(
                 "INSERT INTO memories (content, tags, source_session, created_at) "
@@ -647,6 +973,7 @@ class MemoryTagsAndRecallTest(unittest.TestCase):
         out = tools_memory.repair_split_tags(self.cfg)
         self.assertEqual(len(out["fixed"]), 1)
         self.assertEqual(out["fixed"][0]["new"], "inbox,收件箱")
-        q = tools_memory.memory_query(self.cfg, "inbox", limit=5)
-        self.assertTrue(any(r["tags"] == ["inbox", "收件箱"] for r in q["results"]))
+        with tools_memory._connect(self.cfg) as conn:
+            fixed_tags = conn.execute("SELECT tags FROM memories WHERE content='被污染的记忆'").fetchone()[0]
+        self.assertEqual(fixed_tags, "inbox,收件箱")
         self.assertEqual(tools_memory.repair_split_tags(self.cfg)["fixed"], [])  # 幂等

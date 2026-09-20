@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -66,14 +67,24 @@ def _audit_path(config: dict) -> str:
     return os.path.join(vault_root(config), config.get("audit_path", ".agent-brain/audit/vault.jsonl"))
 
 
-def _audit(config: dict, event: dict) -> None:
+def _audit(config: dict, event: dict) -> bool:
+    """追加审计事件；返回是否落盘成功。
+
+    失败不抛异常（不阻断业务写入），但调用方必须把失败带进返回值——
+    审计缺失的副作用视为"结果未核实"（P0-06：审计写失败不得假报成功）。
+    """
     path = _audit_path(config)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-    with _AUDIT_LOCK, open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _AUDIT_LOCK, open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except OSError as e:
+        print(f"[VAULT] 审计写失败（该副作用结果未核实）: {e}", file=sys.stderr)
+        return False
 
 
 def _atomic_write(full: str, content: str) -> None:
@@ -108,17 +119,27 @@ class VaultGateway:
         with lock:
             previous, _ = _read_revision(full)
             if expected_revision is not None and expected_revision != previous:
+                # CAS 冲突也是必须可追查的副作用尝试（P0-06：冲突有事件）
+                _audit(self.config, {
+                    "operation": "write", "path": rel, "result": "conflict",
+                    "expected_revision": expected_revision, "actual_revision": previous,
+                    "request_id": request_id,
+                })
                 raise VaultConflictError(rel, expected_revision, previous)
             _atomic_write(full, content)
             revision = _revision(content)
-            _audit(self.config, {
-                "operation": "write", "path": rel, "previous_revision": previous,
+            ok = _audit(self.config, {
+                "operation": "write", "path": rel, "result": "written",
+                "previous_revision": previous,
                 "revision": revision, "bytes": len(content.encode("utf-8")),
                 "request_id": request_id,
             })
-        return {"path": rel, "bytes": len(content.encode("utf-8")),
-                "status": "written", "revision": revision,
-                "previous_revision": previous}
+        out = {"path": rel, "bytes": len(content.encode("utf-8")),
+               "status": "written", "revision": revision,
+               "previous_revision": previous}
+        if not ok:
+            out["warning"] = "audit_write_failed_result_unverified"
+        return out
 
     def patch(self, path: str, old: str, new: str, *,
               expected_revision: str | None = None, request_id: str = "") -> dict:
@@ -131,6 +152,11 @@ class VaultGateway:
             if previous is None:
                 raise FileNotFoundError(f"笔记不存在: {path}")
             if expected_revision is not None and expected_revision != previous:
+                _audit(self.config, {
+                    "operation": "patch", "path": rel, "result": "conflict",
+                    "expected_revision": expected_revision, "actual_revision": previous,
+                    "request_id": request_id,
+                })
                 raise VaultConflictError(rel, expected_revision, previous)
             count = content.count(old)
             if count == 0:
@@ -140,10 +166,14 @@ class VaultGateway:
             new_content = content.replace(old, new)
             _atomic_write(full, new_content)
             revision = _revision(new_content)
-            _audit(self.config, {
-                "operation": "patch", "path": rel, "previous_revision": previous,
+            ok = _audit(self.config, {
+                "operation": "patch", "path": rel, "result": "patched",
+                "previous_revision": previous,
                 "revision": revision, "bytes": len(new_content.encode("utf-8")),
                 "request_id": request_id,
             })
-        return {"path": rel, "replaced": 1, "status": "patched",
-                "revision": revision, "previous_revision": previous}
+        out = {"path": rel, "replaced": 1, "status": "patched",
+               "revision": revision, "previous_revision": previous}
+        if not ok:
+            out["warning"] = "audit_write_failed_result_unverified"
+        return out

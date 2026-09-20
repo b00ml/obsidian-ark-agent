@@ -2,10 +2,12 @@ import asyncio
 import json
 import time
 import unittest
+import tempfile
+from pathlib import Path
 
 from agentlab.core.agent import Agent
 from agentlab.core.llm import LLMProvider, LLMResponse
-from agentlab.core.loop import RunConfig, Runner
+from agentlab.core.loop import RunConfig, RunHooks, Runner
 from agentlab.core.message import Message, TokenUsage, ToolCall, ToolCallFunction, tool_result
 from agentlab.memory.working import WorkingMemory
 from agentlab.tools.base import tool
@@ -76,7 +78,8 @@ class _Depo:
     def __init__(self):
         self.commits: list[str] = []
 
-    def commit(self, content, tags=None, source_session="", dedup=False):
+    def commit(self, content, tags=None, source_session="", dedup=False,
+               mem_type="context", bucket=False):
         self.commits.append(content)
         return {"status": "committed"}
 
@@ -191,6 +194,148 @@ class TestLoop(unittest.TestCase):
         res = asyncio.run(self._run(provider))
         self.assertEqual(res.stop_reason, "done")
         self.assertEqual(res.final_output, "结果是 3")
+
+    def test_answer_gate_shadow_records_without_changing_output(self):
+        reg = ToolRegistry()
+
+        @tool(name="rag_retrieve", description="检索", permission="read")
+        def retrieve(query: str) -> str:
+            return json.dumps([{"ref": "wiki/a.md", "status": "active"}])
+
+        reg.register(retrieve)
+        runner = Runner(FakeProvider([_tc("rag_retrieve", {"query": "q"}), "无引用的结论"]), reg)
+        res = asyncio.run(runner.run(
+            Agent(instructions="sys", tools=reg.all()), "q",
+            cfg=RunConfig(answer_gate_mode="shadow"),
+        ))
+        self.assertEqual(res.final_output, "无引用的结论")
+        self.assertEqual(res.answer_gate["reasons"], ["citation_missing"])
+
+    def test_answer_gate_sanitizes_outside_wikilink_before_streaming(self):
+        reg = ToolRegistry()
+
+        @tool(name="rag_retrieve", description="检索", permission="read")
+        def retrieve(query: str) -> str:
+            return json.dumps([{"ref": "wiki/a.md", "status": "active"}])
+
+        reg.register(retrieve)
+        streamed = []
+        runner = Runner(FakeProvider([
+            _tc("rag_retrieve", {"query": "q"}),
+            "依据 [[wiki/a.md]]，另见 [[wiki/related]]。",
+        ]), reg)
+        res = asyncio.run(runner.run(
+            Agent(instructions="sys", tools=reg.all()), "q",
+            hooks=RunHooks(on_text=streamed.append),
+            cfg=RunConfig(answer_gate_mode="shadow"),
+        ))
+        self.assertIn("[[wiki/a.md]]", res.final_output)
+        self.assertIn("`wiki/related`", res.final_output)
+        self.assertNotIn("[[wiki/related]]", res.final_output)
+        self.assertEqual(streamed[-1], res.final_output)
+
+    def test_answer_gate_on_fails_closed_after_rag(self):
+        reg = ToolRegistry()
+
+        @tool(name="rag_retrieve", description="检索", permission="read")
+        def retrieve(query: str) -> str:
+            return json.dumps([{"ref": "wiki/a.md", "status": "active"}])
+
+        reg.register(retrieve)
+        runner = Runner(FakeProvider([_tc("rag_retrieve", {"query": "q"}), "无引用的结论"]), reg)
+        res = asyncio.run(runner.run(
+            Agent(instructions="sys", tools=reg.all()), "q",
+            cfg=RunConfig(answer_gate_mode="on"),
+        ))
+        self.assertEqual(res.stop_reason, "guardrail")
+        self.assertIn("资料不足", res.final_output)
+        self.assertIn("citation_missing", res.answer_gate["reasons"])
+
+    def test_task_state_records_tool_operation_lifecycle(self):
+        from agentlab.runtime.task_state import TaskStateStore
+
+        reg = ToolRegistry()
+        calls = []
+
+        @tool(name="write_once", description="写入", permission="write",
+              side_effects="write", idempotent=False)
+        def write_once(value: str) -> str:
+            calls.append(value)
+            return "written"
+
+        reg.register(write_once)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStateStore(Path(tmp) / "state.db")
+            store.ensure("task-ledger")
+            runner = Runner(FakeProvider([_tc("write_once", {"value": "x"}), "完成"]), reg)
+            res = asyncio.run(runner.run(
+                Agent(instructions="sys", tools=reg.all()), "q",
+                hooks=RunHooks(confirm=lambda _tool, _prompt: True),
+                cfg=RunConfig(task_state_store=store, task_state_id="task-ledger"),
+            ))
+            self.assertEqual(res.final_output, "完成")
+            entries = store.get("task-ledger").pending_tools
+            self.assertEqual(entries[0]["status"], "succeeded")
+            self.assertEqual(calls, ["x"])
+
+    def test_side_effect_adapter_receives_stable_operation_context(self):
+        from agentlab.runtime.task_state import TaskStateStore
+        from agentlab.runtime.operation_context import current_operation_id
+
+        observed: list[str] = []
+        reg = ToolRegistry()
+
+        @tool(name="collect_once", description="采集", permission="read",
+              side_effects="write", idempotent=True)
+        def collect_once() -> str:
+            observed.append(current_operation_id())
+            return "collected"
+
+        reg.register(collect_once)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStateStore(Path(tmp) / "state.db")
+            store.ensure("task-context-op")
+            runner = Runner(FakeProvider([_tc("collect_once", {}), "完成"]), reg)
+            result = asyncio.run(runner.run(
+                Agent(instructions="sys", tools=reg.all()), "q",
+                cfg=RunConfig(task_state_store=store, task_state_id="task-context-op"),
+            ))
+            self.assertEqual(result.final_output, "完成")
+            self.assertEqual(len(observed), 1)
+            self.assertTrue(observed[0])
+            self.assertEqual(len(observed[0]), 32)
+
+    def test_unknown_non_idempotent_operation_is_not_replayed(self):
+        from agentlab.runtime.task_state import TaskStateStore
+
+        reg = ToolRegistry()
+        calls = []
+
+        @tool(name="send_once", description="发送", permission="danger",
+              side_effects="external", idempotent=False)
+        def send_once(value: str) -> str:
+            calls.append(value)
+            return "sent"
+
+        reg.register(send_once)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStateStore(Path(tmp) / "state.db")
+            store.ensure("task-unknown")
+            import hashlib
+            op_id = hashlib.sha1(
+                "task-unknown:send_once:{\"value\": \"x\"}".encode()
+            ).hexdigest()[:32]
+            store.plan_tool("task-unknown", operation_id=op_id,
+                            tool_name="send_once", permission="danger",
+                            side_effects="external", idempotent=False)
+            store.update_tool("task-unknown", op_id, "unknown")
+            runner = Runner(FakeProvider([_tc("send_once", {"value": "x"}), "停"]), reg)
+            res = asyncio.run(runner.run(
+                Agent(instructions="sys", tools=reg.all()), "q",
+                cfg=RunConfig(task_state_store=store, task_state_id="task-unknown"),
+            ))
+            self.assertEqual(calls, [])
+            self.assertEqual(res.final_output, "停")
 
     def test_max_steps_stops(self):
         prov = FakeProvider([_tc("myadd", {"a": 1, "b": 2})] * 50)

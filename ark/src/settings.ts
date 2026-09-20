@@ -1,4 +1,5 @@
 import type { Contact, TodoList, LogEntry, DbCategory, AutoContact } from "./types";
+import type { ArtifactContract } from "./contracts";
 
 /** 邮件账户 */
 export interface MailAccountConfig {
@@ -21,6 +22,9 @@ export interface ReminderPreset {
   value: number; // 提前分钟数
   label: string;
 }
+
+/** RAG 检索路由：关键词可独立使用，也可与向量路叠加。 */
+export type RagMode = "keyword" | "shadow" | "hybrid" | "vector";
 
 /** 信息订阅源（知识信息闭环 ① 主动获取） */
 export interface FeedConfig {
@@ -95,6 +99,15 @@ export interface ArkSettings {
   approvalMode: "risk_based" | "allow_all";
   desktopExePath: string;   // Hermes Desktop：仅 hermes 模式"AI 助手"一键拉起用，留空自动探测
 
+  // RAG 检索（向量可选；配置 provider 后可与关键词路叠加）
+  ragMode: RagMode;
+  ragEmbedBaseUrl: string;
+  ragEmbedModel: string;
+  ragEmbedApiKey: string;
+  ragEmbedTimeout: number;
+  /** Whether automatic long-term memory recall/deposit is enabled. */
+  memoryEnabled: boolean;
+
   // Project 长期任务空间（P0-2/OPT-107）：Vault 内 ark/projects/<id>/ 存 AGENTS.md + project.md
   projects: ProjectInfo[];
   activeProjectId: string;  // 当前激活项目（"" = 全局，不注入项目上下文）
@@ -161,6 +174,7 @@ export interface ArkData {
   weapons: any[];
   weaponResults: any[];
   contactList: Contact[];
+  artifacts: ArtifactContract[];
 }
 
 export const DEFAULT_REMINDER_PRESETS: ReminderPreset[] = [
@@ -229,6 +243,13 @@ export const DEFAULT_SETTINGS: ArkSettings = {
 
   desktopExePath: "",
 
+  ragMode: "shadow",
+  ragEmbedBaseUrl: "",
+  ragEmbedModel: "text-embedding-v4",
+  ragEmbedApiKey: "",
+  ragEmbedTimeout: 30,
+  memoryEnabled: true,
+
   // 内部 ID 保留用于兼容旧配置；用户界面使用中性产品文案。
   skin: "zero",
 
@@ -261,7 +282,25 @@ export function normalizeSettings(settings: ArkSettings): ArkSettings {
   // 不能因为配置字段拼错而让危险工具与 @ 多 Agent 门禁静默放开。
   const mode = settings.approvalMode === "allow_all" ? "allow_all" : "risk_based";
   const captainName = settings.captainName === "舰长" ? "用户" : settings.captainName;
-  return { ...settings, skin: "zero", captainName, approvalMode: mode };
+  const ragMode: RagMode = ["keyword", "shadow", "hybrid", "vector"].includes(settings.ragMode)
+    ? settings.ragMode
+    : "shadow";
+  const ragEmbedTimeout = Number.isFinite(Number(settings.ragEmbedTimeout))
+    && Number(settings.ragEmbedTimeout) > 0
+    ? Number(settings.ragEmbedTimeout)
+    : 30;
+  return {
+    ...settings,
+    skin: "zero",
+    captainName,
+    approvalMode: mode,
+    ragMode,
+    ragEmbedBaseUrl: String(settings.ragEmbedBaseUrl ?? "").trim(),
+    ragEmbedModel: String(settings.ragEmbedModel ?? "text-embedding-v4").trim() || "text-embedding-v4",
+    ragEmbedApiKey: String(settings.ragEmbedApiKey ?? ""),
+    ragEmbedTimeout,
+    memoryEnabled: settings.memoryEnabled !== false,
+  };
 }
 
 function structuredCloneBase(s: ArkSettings): ArkData {
@@ -279,6 +318,7 @@ function structuredCloneBase(s: ArkSettings): ArkData {
     weapons: [],
     weaponResults: [],
     contactList: [],
+    artifacts: [],
   };
 }
 

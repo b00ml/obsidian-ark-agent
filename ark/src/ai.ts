@@ -391,11 +391,11 @@ export async function agentChat(
   const dispatch = (data: string) => {
     if (!data.trim()) return;
     let obj: any;
-    try {
-      obj = JSON.parse(data);
-    } catch {
-      console.warn("[SSE] JSON parse failed:", data.slice(0, 100));
-      return;
+    try { 
+      obj = JSON.parse(data); 
+    } catch { 
+      console.warn("[SSE] JSON parse failed:", data.slice(0, 100)); 
+      return; 
     }
     const t = obj?.type;
     if (t === "response.output_item.added" || t === "response.output_item.done") {
@@ -405,7 +405,11 @@ export async function agentChat(
         cb.onTool?.(activeTool, "start", JSON.stringify(item.arguments ?? ""));
       } else if (item?.type === "function_call_output") {
         const out = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
-        cb.onTool?.(activeTool || "tool", "done", out.slice(0, 500));
+        // Research drafts consume the S0 envelope after the run.  Keep that
+        // structured result intact; prose/tool traces remain bounded so a
+        // large write response cannot inflate the Ark session payload.
+        const detailLimit = /(?:^|[.:])rag_retrieve$/i.test(activeTool) ? 12000 : 500;
+        cb.onTool?.(activeTool || "tool", "done", out.slice(0, detailLimit));
         activeTool = "";
       }
     } else if (t === "response.output_item.done" && obj?.item?.type === "message") {
@@ -445,6 +449,15 @@ export async function agentChat(
       const hist = Array.isArray(sum.history) ? sum.history
         : Array.isArray(resp?.history) ? resp.history : undefined;
       cb.onCompleted?.({ summary: resp?.summary ?? sum, history: hist });
+    } else if (t === "response.failed" || t === "response.cancelled") {
+      // P1-06：服务端终态失败/取消必须用户可见——此前落入"未知事件"仅打
+      // console，agentChat 返回空串被结算成空消息，LLM 402/权限错误完全吞掉。
+      // throw 交给调用方既有 catch（CRT print ERROR / 工作台 Notice）展示。
+      if (t === "response.failed") {
+        throw new Error(String(obj?.error ?? "服务端执行失败（无错误详情）"));
+      }
+      cb.onStatus?.({ elapsed: Number(obj?.elapsed) || 0 });
+      throw new Error(String(obj?.error ?? "服务端已取消本次执行"));
     } else if (t) {
       // 未知事件类型：记录日志但不崩溃
       console.warn("[SSE] Unknown event type:", t, obj);

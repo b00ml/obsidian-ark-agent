@@ -7,4 +7,19 @@
 不重复造检索逻辑（AGENTS.md 能力分流）。检索是 ReAct 里的工具调用，由 agent 决策。
 """
 from agentlab.rag.recall import RAGRecall, RecallItem  # noqa: F401
-from agentlab.rag.assess import RAGAssessor, Sufficiency  # noqa: F401
+from agentlab.rag.query import QueryPlan, build_query_plan, classify_query  # noqa: F401
+from agentlab.rag.rewrite import RewriteResult, rewrite_query, rewrite_query_sync  # noqa: F401
+from agentlab.rag.assess import (AnswerEvidence, AnswerGateResult, RAGAssessor, Sufficiency,
+                                 evaluate_answer_gate, evaluate_generated_answer)  # noqa: F401
+from agentlab.rag.citations import CitationRegistry  # noqa: F401
+from agentlab.rag.index_store import (  # noqa: F401
+    RagIndexStore,
+    RAGIndexStore,
+    IndexCompatibilityError,
+)
+from agentlab.rag.hybrid import (  # noqa: F401
+    HybridRetriever,
+    ShadowLogWriter,
+    entry_key,
+    hybrid_fuse,
+)

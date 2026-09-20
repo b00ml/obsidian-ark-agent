@@ -31,6 +31,8 @@ from pathlib import Path
 
 import requests
 
+from vault_io import controlled_write  # P0-01 受控写入：路径守卫+原子写+审计
+
 # yt-dlp Python API（频道级批量枚举用；单视频下载仍走 YT_DLP_CMD 子进程）。
 # 顶部导入便于测试 mock（patch bt.yt_dlp.YoutubeDL）；
 # 缺失时仅频道枚举不可用，纯文本三层降级流水线不受影响。
@@ -959,8 +961,8 @@ def run_screenshot_mode(bvid: str, title: str, transcript: str,
     note.append("")
 
     note_path = os.path.join(note_dir, f"{safe_title}-screenshots.md")
-    with open(note_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(note))
+    controlled_write(note_path, "\n".join(note),
+                     vault_root=vault_path, overwrite=True, actor="bili-screenshot")
     print_status("DONE", f"截图笔记已生成: {note_path} ({len(shot_paths)}张)")
     return note_path
 
@@ -1083,12 +1085,13 @@ def run_visual_mode(bvid: str, title: str, transcript: str,
     note.append("")
 
     note_path = os.path.join(note_dir, f"{safe_title}-visual.md")
-    with open(note_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(note))
+    controlled_write(note_path, "\n".join(note),
+                     vault_root=vault_path, overwrite=True, actor="bili-visual")
 
     # 三件套补全：逐字稿 + 总结（角色分流；已存在则不覆盖）
-    write_transcript_note(note_dir, safe_title, title, bvid, transcript)
-    summary_path = write_summary_note(note_dir, safe_title, title, bvid, transcript, visual_config)
+    write_transcript_note(note_dir, safe_title, title, bvid, transcript, vault_root=vault_path)
+    summary_path = write_summary_note(note_dir, safe_title, title, bvid, transcript,
+                                      visual_config, vault_root=vault_path)
 
     # 知识编译（优化设计文档4.0 执行线#2，best-effort）：总结落盘后
     # LLM 提取概念/实体 → 增量更新 vault 的 wiki 概念/实体页。
@@ -1107,7 +1110,8 @@ def run_visual_mode(bvid: str, title: str, transcript: str,
 
 
 def write_transcript_note(note_dir: str, safe_title: str, title: str,
-                          bvid: str, transcript: str) -> str:
+                          bvid: str, transcript: str,
+                          vault_root: str | None = None) -> str:
     """写入/复用《逐字稿》笔记（已存在则不覆盖；写入前做保守专名清洗 OPT-095/096）。"""
     target = os.path.join(note_dir, f"{safe_title}-逐字稿.md")
     if not os.path.exists(target):
@@ -1118,13 +1122,14 @@ def write_transcript_note(note_dir: str, safe_title: str, title: str,
             f"> 视频总结见 [[{safe_title}-总结]]\n\n\n"
             f"{va.clean_transcript(transcript)}\n"
         )
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(body)
+        controlled_write(target, body, vault_root=vault_root,
+                         overwrite=True, actor="bili-transcript")
     return target
 
 
 def write_summary_note(note_dir: str, safe_title: str, title: str,
-                       bvid: str, transcript: str, config: dict) -> str:
+                       bvid: str, transcript: str, config: dict,
+                       vault_root: str | None = None) -> str:
     """生成《总结》笔记（听力内容归此，与画面笔记分工；OP-094 三件套）。"""
     target = os.path.join(note_dir, f"{safe_title}-总结.md")
     if os.path.exists(target):
@@ -1141,8 +1146,8 @@ def write_summary_note(note_dir: str, safe_title: str, title: str,
         content = "> ⚠️ 总结为空，请核对画面笔记与逐字稿。"
     body += content + "\n\n## 📝 关联\n- [[{safe_title}-visual]]\n- [[{safe_title}-逐字稿]]\n".format(
         safe_title=safe_title)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(body)
+    controlled_write(target, body, vault_root=vault_root,
+                     overwrite=True, actor="bili-summary")
     return target
 
 
@@ -1372,7 +1377,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-config", default=va.DEFAULT_CONFIG_PATH if va else "config/visual_models.json",
                         help="视觉模型配置文件路径 (默认: config/visual_models.json)")
     parser.add_argument("--vault", default=None,
-                        help="Obsidian Vault 路径，如 C:/path/to/your/obsidian-vault（提供后截图存入 raw/screenshots/，笔记写入 Inbox/）")
+                        help="Obsidian Vault 路径，如 E:/peik1_books（提供后截图存入 raw/screenshots/，笔记写入 Inbox/）")
     # ---- 频道级批量摄取（设计文档4.0 执行线#4）----
     parser.add_argument("--channel", default=None,
                         help="频道/合集/播放列表URL：枚举视频清单后批量入队（不直接连跑）")

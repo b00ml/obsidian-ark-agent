@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from pydantic import BaseModel
@@ -28,6 +28,11 @@ from agentlab.core.llm import LLMProvider, LLMResponse
 from agentlab.core.message import Message, ResultStopReason, ToolResult, TokenUsage, tool_result
 from agentlab.memory.capture import extract_snippets, period
 from agentlab.tools.registry import ConfirmFn, ToolRegistry
+from agentlab.rag.assess import AnswerEvidence, sanitize_generated_answer
+from agentlab.core.run_contract import (
+    RunBudget, RunTrace, CURRENT_RUN_BUDGET, CURRENT_RUN_TRACE, action_fingerprint,
+)
+from agentlab.runtime.operation_verifier import build_verification_metadata
 
 _log = logging.getLogger(__name__)
 
@@ -104,6 +109,7 @@ class RunConfig:
     signal: asyncio.Event | None = None  # 置位则中止（SSE 断连等，对齐 tau loop(signal)）
     memorize_every: int = 0  # 记忆沉淀周期：每 N 轮异步批量沉淀（0=关闭）
     depository: Any | None = None  # 具 .commit(content, tags, source_session, dedup) 记忆仓（对齐 store.MemoryStore）
+    source_session: str = ""  # OPT-224：serve 会话锚，随沉淀写入 source_session（可追溯）
     extractor: Any | None = None  # #10①/OPT-123：LLM 语义提取器（serve 注入，具 async extract(entries)）；None=回退触发词路
     context_tools: bool = True  # 注入 context_status/compress_context（L10/OPT-106）
     context_nudge: float = 0.75  # 用量占比 ≥ 此值 → 注入一次压缩提示（L10/OPT-106）
@@ -112,8 +118,35 @@ class RunConfig:
     compact_slice_tokens: int = 150000  # 单次折叠区段上限（token）：小步多次折叠
     max_tool_calls: int = 40  # 单轮工具调用次数上界（0/None=不限）。见 _BUDGET_NUDGE
     tool_call_nudge: float = 0.6  # 用量占比 ≥ 此值 → 注入一次"收敛"提示
+    # P1 ContextAssembler shadow：可选规划器观察四区上下文契约，不改变兼容渲染器。
+    context_assembler: Any | None = None
+    context_assembler_mode: str = "shadow"
+    context_plan: Any | None = None
+    context_plan_history: list[Any] = field(default_factory=list)
+    task_state: Any | None = None  # P1 structured task checkpoint for context planning
+    task_state_store: Any | None = None  # optional durable operation ledger
+    task_state_id: str = ""
+    vault_root: str = ""  # trusted local root for pre-dispatch verification metadata
+    # P0 answer-level citation/abstention gate.  ``shadow`` records the
+    # decision without changing the answer; ``on`` fails closed after RAG use.
+    answer_gate_mode: str = "off"
+    answer_gate_require_citation: bool = True
+    answer_gate_allow_bounded_partial: bool = False
+    answer_evidence: Any | None = None
+    answer_gate_result: Any | None = None
     range_recorder: Any = None  # L11/OPT-111：折叠区段归档器（serve 注入，具 .archive(list[Message])）；
     # 运行时按请求注入（同 signal），不进 from_config。
+    # P0-06 run-level contracts.  None preserves the legacy limits above.
+    budget: RunBudget | None = None
+    trace: RunTrace | None = None
+    max_llm_calls: int = 0
+    max_react_rounds: int = 0
+    max_plan_steps: int = 0
+    max_retries: int = 0
+    # P0-08 bounded Plan-and-Execute shadow. The compatibility ReAct loop
+    # remains authoritative until an explicit caller executes this plan.
+    plan: Any | None = None
+    plan_mode: str = "shadow"
 
     @classmethod
     def from_config(cls, cfg) -> "RunConfig":
@@ -133,6 +166,22 @@ class RunConfig:
             compact_slice_tokens=int(getattr(limits, "compact_slice_tokens", 150000)),
             max_tool_calls=int(getattr(limits, "max_tool_calls", 40)),
             tool_call_nudge=float(getattr(limits, "tool_call_nudge", 0.6)),
+            max_llm_calls=int(getattr(limits, "max_llm_calls", 0) or 0),
+            max_react_rounds=int(getattr(limits, "max_react_rounds", 0) or 0),
+            max_plan_steps=int(getattr(limits, "max_plan_steps", 0) or 0),
+            max_retries=int(getattr(getattr(cfg, "resilience", None), "max_retries", 0) or 0),
+            context_assembler_mode=str(getattr(
+                getattr(cfg, "context", None), "assembler_mode", "shadow"
+            )),
+            answer_gate_mode=str(getattr(
+                getattr(cfg, "rag", None), "answer_gate_mode", "off"
+            )),
+            answer_gate_require_citation=bool(getattr(
+                getattr(cfg, "rag", None), "answer_gate_require_citation", True
+            )),
+            answer_gate_allow_bounded_partial=bool(getattr(
+                getattr(cfg, "rag", None), "answer_gate_allow_bounded_partial", False
+            )),
         )
 
 
@@ -142,6 +191,8 @@ class AgentResult(BaseModel):
     messages: list[Message]
     usage: TokenUsage
     trace_id: str = ""
+    answer_gate: dict[str, Any] | None = None
+    run_trace: dict[str, Any] | None = None
 
 
 class _RunnerEvents:
@@ -192,6 +243,36 @@ class Runner:
     ) -> AgentResult:
         cfg = cfg or RunConfig()
         hooks = hooks or RunHooks()
+        if cfg.budget is None:
+            cfg.budget = RunBudget.from_timeout(
+                cfg.timeout,
+                max_llm_calls=int(cfg.max_llm_calls or 0),
+                max_tool_calls=int(cfg.max_tool_calls or 0),
+                max_react_rounds=int(cfg.max_react_rounds or 0),
+                max_plan_steps=int(cfg.max_plan_steps or 0),
+                max_retries=int(cfg.max_retries or 0),
+            )
+        else:
+            # Request-level overrides may tighten an injected budget, never widen it.
+            for name in ("max_llm_calls", "max_tool_calls", "max_react_rounds",
+                         "max_plan_steps", "max_retries"):
+                requested = int(getattr(cfg, name, 0) or 0)
+                existing = int(getattr(cfg.budget, name, 0) or 0)
+                if requested and (not existing or requested < existing):
+                    setattr(cfg.budget, name, requested)
+        if cfg.trace is None:
+            cfg.trace = RunTrace(run_id=cfg.budget.run_id)
+        budget_token = CURRENT_RUN_BUDGET.set(cfg.budget)
+        trace_token = CURRENT_RUN_TRACE.set(cfg.trace)
+        if str(cfg.answer_gate_mode or "off").lower() in {"shadow", "on"}:
+            if cfg.answer_evidence is None:
+                cfg.answer_evidence = AnswerEvidence(
+                    require_citation=bool(cfg.answer_gate_require_citation),
+                    allow_bounded_partial=bool(cfg.answer_gate_allow_bounded_partial),
+                )
+        else:
+            cfg.answer_evidence = None
+        cfg.answer_gate_result = None
         messages: list[Message] = []
 
         # 初始上下文：ctx 拼出 system+history，再追加本次 user 输入
@@ -231,14 +312,55 @@ class Runner:
                     )
             else:
                 result = await self._loop(agent, messages, hooks, cfg)
+            if cfg.answer_gate_result is not None:
+                result.answer_gate = cfg.answer_gate_result.to_dict()
+            result.run_trace = cfg.trace.to_dict(cfg.budget) if cfg.trace is not None else None
+            if result.run_trace is not None and getattr(cfg, "context_assembler", None) is not None:
+                result.run_trace["context_assembler"] = self._context_runtime_metrics(result, cfg)
             # OPT-135：run 结束兜底沉淀——短会话（不足 memorize_every 轮）也留痕；
             # 游标保证只处理本轮未消费消息，周期沉淀过的不会重复提取。
             # 触发词/importance 过滤仍在，闲聊不会被灌入库。
             await self._maybe_deposit(cfg, messages, 0, force=True)
             return result
         finally:
+            CURRENT_RUN_BUDGET.reset(budget_token)
+            CURRENT_RUN_TRACE.reset(trace_token)
             self.registry = base_registry
             self._ctx_state = None
+
+    @staticmethod
+    def _context_runtime_metrics(result: AgentResult, cfg: RunConfig) -> dict[str, Any]:
+        """Summarise planner evidence with runtime outcomes for shadow/on comparison."""
+        events = []
+        if cfg.trace is not None:
+            events = [event for event in cfg.trace.events
+                      if event.get("stage") == "context_plan"]
+        last = events[-1] if events else {}
+        gate = getattr(cfg, "answer_gate_result", None)
+        pending_unknown = 0
+        store = getattr(cfg, "task_state_store", None)
+        task_id = str(getattr(cfg, "task_state_id", "") or "")
+        if store is not None and task_id:
+            try:
+                pending_unknown = sum(
+                    1 for row in store.pending_operations(task_id)
+                    if row.get("status") == "unknown"
+                )
+            except Exception:
+                pending_unknown = -1
+        return {
+            "mode": last.get("mode", getattr(cfg, "context_assembler_mode", "shadow")),
+            "plan_updates": len(events),
+            "selected": int(last.get("selected", 0) or 0),
+            "omitted": int(last.get("omitted", 0) or 0),
+            "used_tokens": int(last.get("used_tokens", 0) or 0),
+            "scope_denied": int(last.get("scope_denied", 0) or 0),
+            "tool_calls": int((cfg.trace.counters if cfg.trace else {}).get("tool_calls", 0) or 0),
+            "citations": len(getattr(gate, "allowed_refs", ()) or ()) if gate else 0,
+            "refusal": bool(getattr(gate, "abstained", False)) if gate else False,
+            "task_completion": result.stop_reason == "done",
+            "recovery_unknown": pending_unknown,
+        }
 
     async def _loop(
         self, agent: Agent, messages: list[Message], hooks: RunHooks, cfg: RunConfig
@@ -264,9 +386,14 @@ class Runner:
 
         while True:
             # 取消信号：SSE 断连等置位即中止，停止烧 token（对齐 tau loop(signal)）
+            budget = cfg.budget
             if self._aborted(cfg):
-                return self._stop("aborted", messages)
-
+                if budget is not None:
+                    budget.cancel("aborted")
+                return self._stop("aborted", messages, cfg=cfg)
+            if budget is not None and budget.expired():
+                budget.stop_reason = "deadline"
+                return self._stop("cancelled", messages, cfg=cfg)
             # —— L10/OPT-106：模型主动压缩（compress_context 置的 force 标记） ——
             if state is not None and state.force_compact:
                 state.force_compact = False
@@ -292,18 +419,39 @@ class Runner:
                 elif not nudged and est >= int(eff_budget * cfg.context_nudge):
                     messages.append(Message(role="user", content=_CONTEXT_NUDGE))
                     nudged = True
-            resp = await self.provider.chat(
-                list(messages),
-                tools=self.registry.schemas(),
-                temperature=cfg.temperature,
-                max_tokens=cfg.max_tokens,
-            )
+            self._update_context_plan(messages, cfg)
+            if budget is not None and not budget.admit_round():
+                return self._stop_with_note(messages, [],
+                    "达到 ReAct 回合预算上限，已自动收尾。", reason="guardrail", cfg=cfg)
+            if cfg.trace is not None:
+                cfg.trace.count("rounds")
+            if budget is not None and not budget.admit_llm():
+                return self._stop_with_note(messages, [],
+                    "达到 LLM 调用预算上限，已自动收尾。", reason="guardrail", cfg=cfg)
+            llm_started = __import__("time").time()
+            if cfg.trace is not None:
+                cfg.trace.count("llm_calls")
+            try:
+                remaining = budget.remaining() if budget is not None else None
+                call = self.provider.chat(
+                    list(messages), tools=self.registry.schemas(),
+                    temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+                )
+                resp = await asyncio.wait_for(call, timeout=remaining) if remaining is not None else await call
+            except asyncio.TimeoutError:
+                if budget is not None:
+                    budget.stop_reason = "deadline"
+                return self._stop("cancelled", messages, cfg=cfg)
+            finally:
+                if cfg.trace is not None:
+                    cfg.trace.span("llm", llm_started,
+                                   llm_calls=budget.llm_calls if budget else None)
             if self._aborted(cfg):
                 # OPT-116：打断落在 LLM 调用期间——响应对用户不可见（未发送任何事件），
                 # 直接丢弃不记录不执行；此前这里无检查，打断后仍会记录消息并把整批
                 # 工具（如 B站流水线）跑完才停。半截历史由 run 收尾照常持久化。
-                return self._stop("aborted", messages)
-            self._record_assistant(resp, messages, hooks, step=step)
+                return self._stop("aborted", messages, cfg=cfg)
+            self._record_assistant(resp, messages, hooks, step=step, cfg=cfg)
             # 记忆沉淀调度（S6）：每 memorize_every 轮对触发词命中的新消息做异步批量沉淀
             turn += 1
             await self._maybe_deposit(cfg, messages, turn)
@@ -325,7 +473,12 @@ class Runner:
                         continue
                 else:
                     empty_stuck = 0  # 模型给出文本 → 阶段性复位
-                result = self._finish_turn(agent, messages, resp.content or "")
+                # ``_record_assistant`` may deterministically demote
+                # out-of-scope wikilinks before emitting SSE.  The finish
+                # gate, durable history, and returned final output must use
+                # that same rendered value rather than the provider original.
+                rendered_output = messages[-1].content if messages else (resp.content or "")
+                result = self._finish_turn(agent, messages, rendered_output or "", cfg)
                 if result is not None:
                     return result
                 continue
@@ -341,21 +494,25 @@ class Runner:
 
             # 3) 重复检测（无敌防打转）
             if not cfg.disable_repetition_guard:
-                end = self._detect_repetition(tool_calls, recent, messages)
+                end = self._detect_repetition(tool_calls, recent, messages, cfg=cfg)
                 if end is not None:
                     return end
 
             # 3.5) 工具调用预算（成本上界）：已经提醒过收尾还在调 → 强制结束，
             #      避免"一次响应塞一大堆调用"绕过 max_steps 把单轮成本拖到几十万 token。
             hard = int(cfg.max_tool_calls or 0)
-            if hard and tools_used >= hard:
+            if (budget is not None and not budget.admit_tool(len(tool_calls))) or (hard and tools_used >= hard):
                 return self._stop_with_note(
                     messages, tool_calls,
                     _BUDGET_FORCED_NOTE.format(used=tools_used, hard=hard),
-                    reason="guardrail")
+                    reason="guardrail", cfg=cfg)
 
             # 4) 执行批次（并行/串行）
+            tool_started = __import__("time").time()
             executed = await self._execute_tool_batch(tool_calls, hooks, cfg)
+            if cfg.trace is not None:
+                cfg.trace.span("tool_batch", tool_started,
+                               tool_calls=len(tool_calls))
             messages.extend(
                 Message(role="tool", tool_call_id=r.tool_call_id, content=r.content)
                 for r in executed
@@ -374,6 +531,40 @@ class Runner:
             end = self._post_tool(agent, messages, cfg, step, executed)
             if end is not None:
                 return end
+
+    @staticmethod
+    def _update_context_plan(messages: list[Message], cfg: RunConfig) -> None:
+        """Refresh the optional ContextAssembler plan for the current turn."""
+        assembler = getattr(cfg, "context_assembler", None)
+        if assembler is None:
+            return
+        try:
+            system = [messages[0]] if messages and messages[0].role == "system" else []
+            history = [m for m in messages[1:] if m.role in {"user", "assistant"}]
+            observations = [m for m in messages[1:] if m.role == "tool"]
+            cfg.context_plan = assembler.assemble(
+                task_state=getattr(cfg, "task_state", None),
+                instructions=system,
+                history=history,
+                tool_observations=observations,
+                mode=getattr(cfg, "context_assembler_mode", "shadow"),
+            )
+            # Keep bounded plan snapshots for shadow/on attribution.  They
+            # remain request-local and the evaluator exports only hashes.
+            cfg.context_plan_history.append(cfg.context_plan)
+            del cfg.context_plan_history[:-20]
+            if cfg.trace is not None:
+                metrics = (cfg.context_plan.metrics()
+                           if callable(getattr(cfg.context_plan, "metrics", None))
+                           else {
+                               "mode": getattr(cfg.context_plan, "mode", "shadow"),
+                               "used_tokens": int(getattr(cfg.context_plan, "used_tokens", 0) or 0),
+                               "omitted": len(getattr(cfg.context_plan, "omitted", ()) or ()),
+                           })
+                cfg.trace.span("context_plan", __import__("time").time(), **metrics)
+        except Exception as exc:  # noqa: BLE001 - shadow never blocks a run
+            _log.warning("ContextAssembler shadow failed: %s", exc)
+            cfg.context_plan = None
 
     # ── 取消信号：置位即中止（SSE 断连等，对齐 tau loop(signal)） ──
     def _aborted(self, cfg: RunConfig) -> bool:
@@ -396,7 +587,8 @@ class Runner:
             # 提取/落库失败在 deposit_via_extractor 内部兜底，不影响主循环
             from agentlab.memory.extract import deposit_via_extractor
 
-            await deposit_via_extractor(depo, cfg.extractor, new)
+            await deposit_via_extractor(depo, cfg.extractor, new,
+                                        source_session=cfg.source_session)
             return
         snap = extract_snippets(new)
         if not snap:
@@ -404,13 +596,26 @@ class Runner:
         loop = asyncio.get_running_loop()
         # 异步批量沉淀：同步 brain 调用放 executor，不阻塞事件循环（对齐"异步批量沉淀"）
         for seg in snap:
-            await loop.run_in_executor(None, self._deposit, depo, seg)
+            await loop.run_in_executor(None, self._deposit, depo, seg,
+                                       getattr(cfg, "source_session", ""))
 
     @staticmethod
-    def _deposit(depo: Any, content: str) -> dict:
+    def _deposit(depo: Any, content: str, source_session: str = "") -> dict:
         """单条沉淀（在线程池执行）；仓库不可用等异常不影响主循环，仅留痕。"""
         try:
-            return depo.commit(content, tags=None, source_session="", dedup=True)
+            kwargs = {
+                "tags": None, "source_session": source_session, "dedup": True,
+                "mem_type": "sessions", "bucket": True, "source": "assistant",
+                "source_ref": f"session:{source_session}" if source_session else "",
+                "candidate_first": True,
+            }
+            # Third-party/test depositories may still expose the pre-S1
+            # signature.  Pass only supported keyword arguments.
+            import inspect
+            params = inspect.signature(depo.commit).parameters
+            if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                kwargs = {k: v for k, v in kwargs.items() if k in params}
+            return depo.commit(content, **kwargs)
         except Exception:
             _log.exception("记忆沉淀失败（depository=%s）", type(depo).__name__)
             return {"status": "error"}
@@ -471,11 +676,17 @@ class Runner:
 
     # ── 记录 assistant 消息：usage/stop_reason 回写 + 事件 + 文本钩子 ──
     def _record_assistant(self, resp: LLMResponse, messages: list[Message],
-                          hooks: RunHooks, step: int = 0) -> None:
+                          hooks: RunHooks, step: int = 0,
+                          cfg: RunConfig | None = None) -> None:
+        content = resp.content
+        if content and cfg is not None and cfg.answer_evidence is not None:
+            content = sanitize_generated_answer(
+                content, cfg.answer_evidence.candidate_refs,
+            )
         messages.append(
             Message(
                 role="assistant",
-                content=resp.content,
+                content=content,
                 tool_calls=resp.tool_calls or None,
                 usage=resp.usage,
                 stop_reason=resp.stop_reason,  # type: ignore[arg-type]
@@ -483,10 +694,10 @@ class Runner:
         )
         self.events.emit(
             Ev.MESSAGE_END,
-            MessageEnd(role="assistant", content=resp.content, usage=resp.usage, step=step),
+            MessageEnd(role="assistant", content=content, usage=resp.usage, step=step),
         )
-        if hooks.on_text and resp.content:
-            hooks.on_text(resp.content)
+        if hooks.on_text and content:
+            hooks.on_text(content)
 
     # ── 空回合拉回：剔除空 assistant（学 tau：空失败不回放下轮），注入轻 steer 续跑 ──
     @staticmethod
@@ -501,11 +712,26 @@ class Runner:
         messages.append(Message(role="user", content=_INCOMPLETE_STEER))
 
     # ── 无工具调用：返回结束 AgentResult 或 None（注入 follow_up/steering 后需续跑）──
-    def _finish_turn(self, agent: Agent, messages: list[Message], output: str) -> AgentResult | None:
+    def _finish_turn(self, agent: Agent, messages: list[Message], output: str,
+                     cfg: RunConfig) -> AgentResult | None:
         ok = all(g(output) for g in (agent.guardrails or [])) if agent.guardrails else True
         ok = ok and validate_output(output)
         if not ok:
             return self._stop("guardrail", messages)
+        if cfg.answer_evidence is not None:
+            gate = cfg.answer_evidence.check(output)
+            cfg.answer_gate_result = gate
+            if gate is not None and str(cfg.answer_gate_mode).lower() == "on" \
+                    and not gate.allowed and not gate.abstained:
+                if gate.decision == "conflicting":
+                    safe_output = "检索到的资料存在冲突，暂时无法安全作答，请先确认采用哪一份来源。"
+                else:
+                    safe_output = "当前检索资料不足以支持带来源的可靠回答，请补充资料或缩小问题范围。"
+                # Do not leave the rejected model claim in the replayable
+                # assistant history; retain only the safe user-visible result.
+                if messages and messages[-1].role == "assistant":
+                    messages[-1].content = safe_output
+                return self._stop("guardrail", messages, final_output=safe_output)
         self.events.emit(Ev.TURN_END, TurnEnd())
         injected = agent.drain_follow_ups() or agent.drain_steering()
         if injected:
@@ -541,17 +767,15 @@ class Runner:
 
     # ── 3) 重复调用防打转（OPT-117 批次级）：整批签名连续两轮完全相同 → 中断 ──
     def _detect_repetition(self, tool_calls: list, recent: list[str],
-                           messages: list[Message]) -> AgentResult | None:
+                           messages: list[Message], cfg: RunConfig | None = None) -> AgentResult | None:
         """以"一个响应批"为比较单位：批内各调用签名排序后拼接，连续两批完全一致才算打转。
 
         旧版按扁平列表比对最近两次调用——多工具批（collect+read_queue）之后单独
         复读 read_queue 属**合法状态复查**（collect 刚改过队列），却被误判打转静默
         中止（2026-09-07 收件箱实测）。真循环（同批反复重发）依旧两轮即拦。
         """
-        sigs = sorted(
-            hashlib.sha1(f"{c.function.name}:{c.function.arguments}".encode()).hexdigest()
-            for c in tool_calls
-        )
+        sigs = sorted(action_fingerprint(c.function.name, c.function.arguments)
+                      for c in tool_calls)
         recent.append("|".join(sigs))
         looping = len(recent) >= 2 and recent[-1] == recent[-2]
         del recent[:-_REPETITION_WINDOW]  # 仅保留最近窗口
@@ -560,11 +784,12 @@ class Runner:
         return self._stop_with_note(
             messages, tool_calls,
             "连续两轮重复调用同一组工具（名称与参数完全相同），已自动中止以免空转。"
-            "如需继续，请更换参数，或先执行会改变状态的操作再复核。")
+            "如需继续，请更换参数，或先执行会改变状态的操作再复核。", cfg=cfg)
 
     # ── OPT-117：中止时给用户可见说明 + 悬挂 tool_calls 补占位（历史合法） ──
     def _stop_with_note(self, messages: list[Message], tool_calls: list,
-                        note: str, reason: ResultStopReason = "max_steps") -> AgentResult:
+                        note: str, reason: ResultStopReason = "max_steps",
+                        cfg: RunConfig | None = None) -> AgentResult:
         """防打转/步数上限收尾。此前静默 _stop：final_output 空、UI 无任何解释，
         且未执行批的 assistant.tool_calls 悬挂在历史里（下次请求可能被 API 拒绝）。"""
         for c in tool_calls:
@@ -572,7 +797,7 @@ class Runner:
                 role="tool", tool_call_id=c.id, name=c.function.name,
                 content="[repeat_guard] 因连续重复调用被中止，本工具未执行"))
         messages.append(Message(role="assistant", content=note))
-        return self._stop(reason, messages, final_output=note)
+        return self._stop(reason, messages, final_output=note, cfg=cfg)
 
     # ── 4) 执行批次：工具粒度串并行调度（S6） ──
     async def _execute_tool_batch(self, tool_calls: list, hooks: RunHooks,
@@ -625,16 +850,18 @@ class Runner:
         return None
 
     def _stop(self, reason: ResultStopReason, messages: list[Message],
-              final_output: str = "") -> AgentResult:
+              final_output: str = "", cfg: RunConfig | None = None) -> AgentResult:
         self.events.emit(Ev.AGENT_END, AgentEnd(stop_reason=reason))
         return AgentResult(
             final_output=final_output, stop_reason=reason,
             messages=messages, usage=_sum_usage(messages),
+            run_trace=cfg.trace.to_dict() if cfg is not None and cfg.trace is not None else None,
         )
 
     async def _execute_one(
         self, call, hooks: RunHooks, cfg: RunConfig
     ) -> ToolResult:
+        started_at = __import__("time").time()
         self.events.emit(
             Ev.TOOL_START,
             ToolStart(name=call.function.name, arguments=call.function.arguments),
@@ -647,16 +874,132 @@ class Runner:
             if hooks.on_tool:
                 hooks.on_tool(name, "progress", {"elapsed": elapsed})
 
+        task_store = getattr(cfg, "task_state_store", None)
+        task_id = str(getattr(cfg, "task_state_id", "") or "")
+        operation_id = ""
+        operation_context_token = None
+        tracked_tool = None
+        blocked_unknown = False
+        blocked_settled = False
+        settled_status = ""
+        if task_store is not None and task_id:
+            try:
+                tracked_tool = self.registry.get(call.function.name)
+                action_id = action_fingerprint(call.function.name, call.function.arguments)
+                operation_id = hashlib.sha1(
+                    f"{task_id}:{action_id}".encode("utf-8", "replace")
+                ).hexdigest()[:32]
+                # Checkpoint rows created before action fingerprints used the
+                # raw JSON string.  Keep an exact legacy lookup so an upgrade
+                # cannot make an old unknown row invisible to recovery.
+                legacy_operation_id = hashlib.sha1(
+                    f"{task_id}:{call.function.name}:{call.function.arguments}".encode(
+                        "utf-8", "replace"
+                    )
+                ).hexdigest()[:32]
+                previous = task_store.get(task_id)
+                if previous is not None and any(
+                    row.get("operation_id") == legacy_operation_id
+                    for row in previous.pending_tools
+                ):
+                    operation_id = legacy_operation_id
+                state = task_store.plan_tool(
+                    task_id,
+                    operation_id=operation_id,
+                    tool_name=call.function.name,
+                    arguments_hash=action_id,
+                    permission=getattr(tracked_tool, "permission", "read"),
+                    side_effects=getattr(tracked_tool, "side_effects", "") or "",
+                    idempotent=getattr(tracked_tool, "idempotent", None),
+                    verification=build_verification_metadata(
+                        call.function.name, call.function.arguments,
+                        vault_root=getattr(cfg, "vault_root", None),
+                        operation_id=operation_id,
+                    ),
+                )
+                try:
+                    from agentlab.runtime.operation_context import bind_operation_id
+                    operation_context_token = bind_operation_id(operation_id)
+                except (ImportError, ModuleNotFoundError):
+                    operation_context_token = None
+                entry = next((row for row in state.pending_tools
+                              if row.get("operation_id") == operation_id), None)
+                # A stale non-idempotent write must be checked externally or by
+                # HITL; re-running it from a recovered checkpoint is unsafe.
+                if entry and entry.get("status") == "unknown" and (
+                        getattr(tracked_tool, "permission", "read") != "read"
+                        or getattr(tracked_tool, "side_effects", "") not in {"", "none"}):
+                    # Idempotency is not proof that the external operation did
+                    # not already happen.  Every side effect must be settled
+                    # by the verifier or explicit human evidence first.
+                    blocked_unknown = True
+                elif entry and entry.get("status") in {"succeeded", "failed", "cancelled"} and \
+                        getattr(tracked_tool, "permission", "read") != "read":
+                    # A checkpointed terminal side effect is evidence that
+                    # this exact operation was already settled.  Do not let a
+                    # later model turn turn the ledger into a replay queue.
+                    blocked_settled = True
+                    settled_status = str(entry.get("status"))
+                elif entry and entry.get("status") == "planned":
+                    task_store.update_tool(task_id, operation_id, "running")
+            except Exception as exc:  # checkpoint is a shadow aid, never a hard dependency
+                _log.warning("task operation ledger unavailable: %s", exc)
+
         try:
-            result = await self.registry.execute(
-                call, confirm=hooks.confirm, max_result_chars=cfg.max_tool_result_chars,
-                progress=_progress, signal=cfg.signal,
-            )
+            if blocked_unknown:
+                result = tool_result(
+                    call.id,
+                    "[AGENT_SIDE_EFFECT_UNKNOWN] 上一次运行可能已执行该写操作；"
+                    "已暂停重发，请先查询外部状态或经用户确认后重试。",
+                )
+            elif blocked_settled:
+                result = tool_result(
+                    call.id,
+                    "[AGENT_OPERATION_ALREADY_SETTLED] 该写操作已记录为 "
+                    f"{settled_status}，本次不会自动重放。",
+                )
+            else:
+                pending = self.registry.execute(
+                    call, confirm=hooks.confirm, max_result_chars=cfg.max_tool_result_chars,
+                    progress=_progress, signal=cfg.signal,
+                )
+                remaining = cfg.budget.remaining() if cfg.budget is not None else None
+                result = await asyncio.wait_for(pending, timeout=remaining) if remaining is not None else await pending
+        except asyncio.TimeoutError:
+            if cfg.budget is not None:
+                cfg.budget.stop_reason = "deadline"
+            result = tool_result(call.id, "[AGENT_DEADLINE] 工具调用超过本次请求剩余截止时间")
         except AgentError as e:
             # 未注册/权限拒绝/参数错误：包装成工具结果，让模型感知并纠错，不中断循环
             result = ToolResult(
                 role="tool", tool_call_id=call.id, content=f"[{e.code}] {e.message}"
             )
+        finally:
+            if operation_context_token is not None:
+                try:
+                    from agentlab.runtime.operation_context import reset_operation_id
+                    reset_operation_id(operation_context_token)
+                except (ImportError, ModuleNotFoundError):
+                    pass
+        if task_store is not None and task_id and operation_id and not (
+                blocked_unknown or blocked_settled):
+            try:
+                content = str(result.content or "")
+                if "超时" in content or "仍在后台运行" in content or "[已中止]" in content:
+                    outcome = "unknown" if getattr(tracked_tool, "permission", "read") != "read" else "failed"
+                elif content.startswith("[工具执行失败]") or content.startswith("[AGENT_"):
+                    outcome = "failed"
+                else:
+                    outcome = "succeeded"
+                task_store.update_tool(
+                    task_id, operation_id, outcome,
+                    result_ref=f"tool:{call.function.name}:{call.id}",
+                    error=content if outcome in {"failed", "unknown"} else "",
+                )
+            except Exception as exc:
+                _log.warning("task operation settlement unavailable: %s", exc)
+        if cfg.answer_evidence is not None:
+            cfg.answer_evidence.observe(call.function.name, result.content)
         if hooks.on_tool:
             hooks.on_tool(
                 call.function.name, "end",
@@ -665,6 +1008,15 @@ class Runner:
         self.events.emit(
             Ev.TOOL_END, ToolEnd(name=call.function.name, result=result.content)
         )
+        if cfg.trace is not None:
+            cfg.trace.count("tool_calls")
+            cfg.trace.span(
+                "tool", started_at, tool_name=call.function.name,
+                tool_call_id=call.id,
+                action_fingerprint=action_fingerprint(call.function.name, call.function.arguments),
+                result_fingerprint=action_fingerprint(
+                    call.function.name, call.function.arguments, result=result.content),
+            )
         return result
 
 

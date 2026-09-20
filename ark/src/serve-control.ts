@@ -10,8 +10,41 @@
  *    token 缺失时 start 会显式报错），ark 侧 agentlabUrl 仅用于健康探测。
  */
 import { execFile } from "child_process";
+import { existsSync } from "fs";
+import { homedir } from "os";
 import { requestUrl } from "obsidian";
-import { ArkSettings } from "./settings";
+import { ArkSettings, RagMode } from "./settings";
+
+/** 将 Ark 设置页的友好模式映射为 agentlab RagConfig 环境覆盖。 */
+export function ragEnvironment(settings: ArkSettings): Record<string, string> {
+  const mode: RagMode = settings.ragMode || "shadow";
+  const endpoint = (settings.ragEmbedBaseUrl || "").trim();
+  const vectorMode = mode === "keyword" ? "off"
+    : mode === "shadow" ? "shadow"
+      : "on";
+  // 没有 endpoint 时强制关闭 provider，避免后端 config.json 中旧配置意外启用向量。
+  const enabled = Boolean(endpoint) && mode !== "keyword";
+  const lexicalMode = !enabled || mode !== "vector" ? "on" : "off";
+  return {
+    AGENT_RAG_VECTOR_ENABLED: enabled ? "true" : "false",
+    AGENT_RAG_VECTOR_MODE: enabled ? vectorMode : "off",
+    // Shadow collects vector evidence only. A display-changing fallback needs
+    // its own production gate and must never be implied by selecting shadow.
+    AGENT_RAG_VECTOR_FALLBACK_MODE: "off",
+    AGENT_RAG_LEXICAL_MODE: lexicalMode,
+    // Ark owns the migration point: once a provider is configured, serve uses
+    // the versioned P2 single index and can initialize it on first reconcile.
+    // Keyword-only remains legacy and never creates an embedding index.
+    AGENT_RAG_INDEX_BACKEND: enabled ? "p2" : "legacy",
+    AGENT_RAG_EMBED_BASE_URL: endpoint,
+    AGENT_RAG_EMBED_MODEL: (settings.ragEmbedModel || "text-embedding-v4").trim() || "text-embedding-v4",
+    AGENT_RAG_EMBED_API_KEY: settings.ragEmbedApiKey || "",
+    AGENT_RAG_EMBED_TIMEOUT: String(Number(settings.ragEmbedTimeout) > 0 ? settings.ragEmbedTimeout : 30),
+    // One user-facing switch controls implicit long-term-memory behavior.
+    // Existing Markdown memories remain intact when this is disabled.
+    AGENT_MEMORY_ENABLED: settings.memoryEnabled === false ? "false" : "true",
+  };
+}
 
 /** agentlab serve 健康探测（GET {agentlabUrl 去掉 /v1}/health）——
  *  始终盯 agentlabUrl，不随 agentProvider 切换（ribbon/按钮是 agentlab 专属）。 */
@@ -26,16 +59,19 @@ export async function serveUp(settings: ArkSettings): Promise<boolean> {
   }
 }
 
-/** serve 启动目录（须含 config/config.json）：由用户设置，空值使用当前进程目录 */
+/** serve 启动目录（须含 config/config.json）：设置覆盖 > 项目默认 */
 export function serveWorkdir(settings: ArkSettings): string {
-  return (settings.agentlabWorkdir || "").trim();
+  return (settings.agentlabWorkdir || "").trim() || "agentlab";
 }
 
-/** python 可执行文件：设置覆盖 > PATH 上的 python */
+/** python 可执行文件：设置覆盖 > 项目 .venv > PATH 上的 python */
 export function resolvePython(settings: ArkSettings): string {
   const configured = (settings.agentlabExePath || "").trim();
   if (configured) return configured;
-  return "python";
+  const candidates = process.platform === "win32"
+    ? [`${process.cwd()}\\.venv\\Scripts\\python.exe`, `${homedir()}\\.venv\\Scripts\\python.exe`]
+    : [`${process.cwd()}/.venv/bin/python`, `${homedir()}/.venv/bin/python`];
+  return candidates.find((p) => existsSync(p)) || "python";
 }
 
 function runManage(settings: ArkSettings, action: "start" | "stop" | "status",
@@ -45,7 +81,7 @@ function runManage(settings: ArkSettings, action: "start" | "stop" | "status",
       resolvePython(settings),
       ["-m", "agentlab.runtime.serve_manage", action],
       {
-        cwd: serveWorkdir(settings) || undefined,
+        cwd: serveWorkdir(settings),
         timeout: timeoutMs,
         encoding: "utf8",
         windowsHide: true,
@@ -55,6 +91,7 @@ function runManage(settings: ArkSettings, action: "start" | "stop" | "status",
           // 服务端 serve_config() 读取该变量覆盖 cfg.approval_mode。
           AGENTLAB_APPROVAL_MODE:
             settings.approvalMode === "allow_all" ? "allow_all" : "risk_based",
+          ...(action === "start" ? ragEnvironment(settings) : {}),
         },
       },
       (err, stdout, stderr) => {

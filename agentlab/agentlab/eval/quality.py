@@ -272,6 +272,44 @@ async def run_task(cfg, build_backend, task: dict, *, project_id: str | None = N
     }
 
 
+def vault_corroboration_hint(answer: str, vault_root: str | pathlib.Path | None,
+                             limit_chars: int = 900) -> str:
+    """对答案做启发式出处预扫，生成附加给评审的"对证提示"（OPT-221）。
+
+    背景（M4 基线对证，OPT-220）：评审判编造 9 条中 5 条在 Vault 有出处——证据块是
+    节选，出处被切掉时评审把真话判成编造，factuality 系统性低估。本函数把 audit 启发式
+    （_claim_tokens 抽可对证字面量）前移到评审输入。
+
+    抗误报口径与 audit_claims 一致：同一文件命中 ≥2 个不同 token，或单个长度 ≥12 的
+    字面量逐字命中，才算"已对证"；短数字单命中太泛不提示。启发式找不到的不提示，
+    评审口径不变。返回空字符串表示无命中（或未配置 vault_root）。
+    """
+    if not vault_root or not answer:
+        return ""
+    toks = list(dict.fromkeys(t for t in _claim_tokens(answer) if t.strip()))
+    if not toks:
+        return ""
+    files = list(_vault_texts(vault_root))
+    best: dict[str, set[str]] = {}
+    for tok in toks:
+        for rel, text in files:
+            if tok in text:
+                best.setdefault(rel, set()).add(tok)
+    hits: list[str] = []
+    for rel, matched in best.items():
+        strong = [t for t in matched if len(t) >= 12]
+        if len(matched) >= 2 or strong:
+            shown = ", ".join(sorted(matched, key=len, reverse=True)[:4])
+            hits.append(f"- {rel.replace(chr(92), '/')}: 字面量 {shown} 逐字命中（可对证，非编造）")
+        if sum(len(h) for h in hits) > limit_chars:
+            break
+    if not hits:
+        return ""
+    return ("\n\n【出处对证提示（本地启发式预扫，逐字命中 Vault 文本）】\n"
+            "以下文件中逐字命中了答案里的字面量，评审判定 factuality 时应视为有依据，"
+            "不得因可核验清单节选中未出现而判为 hallucinated：\n" + "\n".join(hits))
+
+
 async def judge_answer(llm, task: dict, answer: str, evidence: str = "") -> dict:
     """评审单条答案，返回四维分数 + 幻觉/遗漏清单 + 理由。
 
@@ -437,7 +475,11 @@ async def run_quality_baseline(cfg, *, tasks: list[dict], judge_llm,
         try:
             run = await run_task(cfg, build_backend, task, project_id=project_id)
             row.update(run)
-            row["scores"] = await judge_answer(judge_llm, task, run["answer"], run.get("evidence", ""))
+            # OPT-221：评审证据附加启发式对证提示——answer 中的字面量在 Vault 逐字命中
+            # 的，评审不再因清单节选未见而判编造（M4 基线对证：9 条判编造 5 条有出处）。
+            evidence = run.get("evidence", "") + vault_corroboration_hint(
+                run.get("answer", ""), getattr(cfg, "vault_root", None))
+            row["scores"] = await judge_answer(judge_llm, task, run["answer"], evidence)
         except Exception as e:  # noqa: BLE001 —— 单条失败不能毁掉整轮基线
             row["error"] = f"{type(e).__name__}: {e}"
             row["scores"] = None

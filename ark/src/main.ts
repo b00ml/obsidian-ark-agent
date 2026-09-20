@@ -20,6 +20,8 @@ import { createProject } from "./projects";
 import { getSkin } from "./skins";
 import { installEditorAiMenu, runTodayTodos } from "./ai-asst";
 import { serveStart, serveStop, serveStatusText, serveUp } from "./serve-control";
+import { restoreProjectArtifacts } from "./artifacts";
+import { notifyMemoryReviewDue, openMemoryLifecycle, openMemoryReview } from "./memory-review";
 
 export default class ArkOSPlugin extends Plugin {
   data: ArkData = emptyData();
@@ -28,6 +30,10 @@ export default class ArkOSPlugin extends Plugin {
 
   async onload() {
     await this.loadArkData();
+    // F3：ArkData 可丢弃，Project 成果侧车可在重启后恢复当前项目的结果索引。
+    if (this.data.settings.activeProjectId) {
+      await restoreProjectArtifacts(this, this.data.settings.activeProjectId);
+    }
 
     this.registerView(VIEW_TYPE_SPACE_OS, (leaf: WorkspaceLeaf) => new SpaceOSView(leaf, this));
 
@@ -48,6 +54,20 @@ export default class ArkOSPlugin extends Plugin {
       name: "停止 agentlab 服务",
       callback: () => void this.serveAction("stop"),
     });
+    this.addCommand({
+      id: "review-long-term-memory",
+      name: "复核到期长期记忆",
+      callback: () => openMemoryReview(this),
+    });
+    this.addCommand({
+      id: "manage-long-term-memory",
+      name: "管理长期记忆",
+      callback: () => openMemoryLifecycle(this),
+    });
+    void notifyMemoryReviewDue(this);
+    this.registerInterval(window.setInterval(
+      () => void notifyMemoryReviewDue(this), 12 * 60 * 60 * 1000,
+    ));
     this.addCommand({
       id: "open-ark",
       name: `打开 ${brand} 工作台`,

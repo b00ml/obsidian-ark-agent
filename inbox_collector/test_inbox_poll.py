@@ -193,6 +193,32 @@ class TestPoll(unittest.TestCase):
             store = InboxQueueStore(cfg["queue_db_path"])
             self.assertIn("m1", store.seen_markers())
 
+    @mock.patch("inbox_poll.list_messages")
+    @mock.patch("inbox_poll.read_message")
+    def test_collection_operation_is_queryable_after_queue_commit(self, mock_read, mock_list):
+        mock_list.return_value = [{"message_id": "m-op"}]
+        mock_read.return_value = self._fake_detail(
+            "m-op", '<a href="https://www.bilibili.com/video/BV1xx411x7xx">x</a>')
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._cfg(tmp)
+            self.assertEqual(ip.poll(cfg, operation_id="op-collect-1"), 1)
+            store = InboxQueueStore(cfg["queue_db_path"])
+            operation = store.collection_operation("op-collect-1")
+            self.assertEqual(operation["status"], "succeeded")
+            self.assertEqual(operation["new_tasks"], 1)
+            self.assertEqual(store.list_tasks()[0]["operation_id"], "op-collect-1")
+
+    @mock.patch("inbox_poll.list_messages")
+    @mock.patch("inbox_poll.read_message")
+    def test_collection_exposes_stage_boundaries_without_affecting_queue(self, mock_read, mock_list):
+        mock_list.return_value = [{"message_id": "m-stage"}]
+        mock_read.return_value = self._fake_detail(
+            "m-stage", '<a href="https://www.bilibili.com/video/BV1xx411x7xx">x</a>')
+        with tempfile.TemporaryDirectory() as tmp:
+            stages = []
+            self.assertEqual(ip.poll(self._cfg(tmp), stage_callback=stages.append), 1)
+            self.assertEqual(stages, ["fetched", "parsed", "completed"])
+
 
 class TestQueueStore(unittest.TestCase):
     def test_duplicate_task_still_marks_message_seen(self):

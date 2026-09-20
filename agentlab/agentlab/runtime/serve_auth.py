@@ -22,6 +22,7 @@ _DEFAULT_WRITE_ALLOW = {
     "bili_screenshot",
     "article_summarize",
     "memory_commit",
+    "memory_review",
 }
 
 

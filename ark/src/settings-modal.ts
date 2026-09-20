@@ -7,6 +7,7 @@ import type { FeedConfig } from "./settings";
 import { probeHermes } from "./ai";
 import { getSkin } from "./skins";
 import { selectChannel } from "./ai-asst";
+import { diagnoseRagSettings, ragStrategyLabel } from "./rag-diagnostics";
 
 const AI_PROVIDERS: Record<string, string> = {
   "": "未启用",
@@ -17,7 +18,7 @@ const AI_PROVIDERS: Record<string, string> = {
   custom: "自定义 OpenAI 兼容",
 };
 
-type SettingsTab = "basic" | "ai" | "comm";
+type SettingsTab = "basic" | "ai" | "rag" | "comm";
 
 /** 打开设置中心 */
 export function openSettings(plugin: ArkOSPlugin): void {
@@ -48,6 +49,7 @@ export class SettingsModal extends Modal {
     const defs: { k: SettingsTab; label: string }[] = [
       { k: "basic", label: "基础" },
       { k: "ai", label: "AI 助手" },
+      { k: "rag", label: "检索" },
       { k: "comm", label: "通信" },
     ];
     defs.forEach((d) => {
@@ -89,6 +91,7 @@ export class SettingsModal extends Modal {
     this.content.empty();
     if (this.tab === "basic") this.renderBasic();
     else if (this.tab === "ai") this.renderAI();
+    else if (this.tab === "rag") this.renderRag();
     else this.renderComm();
   }
 
@@ -301,8 +304,8 @@ export class SettingsModal extends Modal {
           .onChange((v) => { this.s.approvalMode = v === "allow_all" ? "allow_all" : "risk_based"; });
       });
     new Setting(this.content).setName("Agentlab 模型").setDesc("agentlab 内 model 名，默认 agentlab-demo").addText((t) => t.setValue(this.s.agentlabModel || "agentlab-demo").onChange((v) => { this.s.agentlabModel = v; }));
-    new Setting(this.content).setName("Agentlab Python").setDesc("「AI 助手」一键拉起 serve 的 Python 可执行文件；留空使用 PATH 中的 python").addText((t) => t.setPlaceholder("python 或可执行文件路径").setValue(this.s.agentlabExePath || "").onChange((v) => { this.s.agentlabExePath = v; }));
-    new Setting(this.content).setName("Agentlab 目录").setDesc("serve 启动目录（须含 config/config.json）；请填写 agentlab 项目目录").addText((t) => t.setPlaceholder("C:\\path\\to\\obsidian-ark-agent\\agentlab").setValue(this.s.agentlabWorkdir || "").onChange((v) => { this.s.agentlabWorkdir = v; }));
+    new Setting(this.content).setName("Agentlab Python").setDesc("「AI 助手」一键拉起 serve 的 python 可执行文件；留空自动探测项目 .venv").addText((t) => t.setPlaceholder("留空自动（项目 .venv）").setValue(this.s.agentlabExePath || "").onChange((v) => { this.s.agentlabExePath = v; }));
+    new Setting(this.content).setName("Agentlab 目录").setDesc("serve 启动目录（须含 config/config.json）；留空使用当前项目的 agentlab 目录").addText((t) => t.setPlaceholder("agentlab").setValue(this.s.agentlabWorkdir || "").onChange((v) => { this.s.agentlabWorkdir = v; }));
     new Setting(this.content)
       .setName("Hermes Desktop 路径")
       .setDesc("点「AI 助手」优先拉起桌面 GUI（Hermes.exe），留空则回退 CRT 终端")
@@ -312,6 +315,72 @@ export class SettingsModal extends Modal {
       const label = this.s.agentProvider === "agentlab" ? "agentlab" : "Hermes";
       new Notice(r.ok ? `${label} 已连接 v${r.version ?? "?"}` : `${label} 未运行：${r.error ?? ""}`);
     }));
+  }
+
+  // ===== 知识库检索 =====
+  private renderRag() {
+    this.section("检索方式");
+    const diagnostics = diagnoseRagSettings(this.s);
+    const diag = this.content.createDiv({ cls: "sos-rag-diagnostics" });
+    diag.createDiv({ cls: "sos-rag-diagnostics-title", text: "当前生效配置" });
+    diag.createDiv({ cls: "sos-rag-diagnostics-line", text:
+      `策略：${ragStrategyLabel(diagnostics.effectiveStrategy)} · 关键词：${diagnostics.lexicalEnabled ? "启用" : "关闭"} · 向量：${diagnostics.vectorEnabled ? "启用" : "关闭"}` });
+    diag.createDiv({ cls: "sos-rag-diagnostics-line", text:
+      `Provider：${diagnostics.providerConfigured ? "已配置地址" : "未配置地址"} · Key：${diagnostics.apiKeyConfigured ? "已填写" : "未填写"} · 全局门禁：${diagnostics.productionGate === "blocked" ? "未开放" : "仅手工灰度"}` });
+    diagnostics.warnings.forEach((warning) => diag.createDiv({ cls: "sos-rag-diagnostics-warning", text: `提示：${warning}` }));
+    new Setting(this.content)
+      .setName("召回模式")
+      .setDesc("关键词适合标题、BV 号和代码；向量适合同义表达；混合模式会同时召回并用 RRF 融合。")
+      .addDropdown((dd) => {
+        dd.addOption("keyword", "仅关键词（轻量，不调用 embedding）");
+        dd.addOption("shadow", "关键词展示 + 向量观测（推荐先用）");
+        dd.addOption("hybrid", "关键词 + 向量（RRF 融合）");
+        dd.addOption("vector", "仅向量（实验）");
+        dd.setValue(this.s.ragMode || "shadow")
+          .onChange((v) => { this.s.ragMode = v as ArkSettings["ragMode"]; });
+      });
+    new Setting(this.content)
+      .setName("Embedding API 地址")
+      .setDesc("OpenAI 兼容 /embeddings 地址；留空则不启用向量路。")
+      .addText((t) => t
+        .setPlaceholder("https://dashscope.aliyuncs.com/compatible-mode/v1")
+        .setValue(this.s.ragEmbedBaseUrl || "")
+        .onChange((v) => { this.s.ragEmbedBaseUrl = v.trim(); }));
+    new Setting(this.content)
+      .setName("Embedding 模型")
+      .setDesc("例如 text-embedding-v4；需要与 API 地址匹配。")
+      .addText((t) => t
+        .setPlaceholder("text-embedding-v4")
+        .setValue(this.s.ragEmbedModel || "text-embedding-v4")
+        .onChange((v) => { this.s.ragEmbedModel = v.trim(); }));
+    new Setting(this.content)
+      .setName("Embedding API Key")
+      .setDesc("仅在 provider 要求鉴权时填写；不会写入 agentlab/config.json。")
+      .addText((t) => {
+        t.inputEl.setAttribute("type", "password");
+        t.setPlaceholder("sk-...").setValue(this.s.ragEmbedApiKey || "")
+          .onChange((v) => { this.s.ragEmbedApiKey = v; });
+      });
+    new Setting(this.content)
+      .setName("Embedding 超时（秒）")
+      .setDesc("网络异常时会走有限重试；建议 10～60 秒。")
+      .addText((t) => {
+        t.inputEl.setAttribute("type", "number");
+        t.inputEl.setAttribute("min", "1");
+        t.inputEl.setAttribute("max", "300");
+        t.setValue(String(this.s.ragEmbedTimeout || 30))
+          .onChange((v) => { this.s.ragEmbedTimeout = Number(v) || 30; });
+      });
+    this.content.createDiv({
+      cls: "sos-hint",
+      text: "保存后重启 Agentlab serve 生效。未填写 API 地址时，即使选择混合/向量模式也会安全回退到关键词。",
+    });
+    new Setting(this.content)
+      .setName("启用长期记忆")
+      .setDesc("开启后自动召回并沉淀长期记忆；关闭只停止隐式使用，不删除已有 Markdown 记忆，也不影响人工管理和显式 memory 工具。")
+      .addToggle((toggle) => toggle
+        .setValue(this.s.memoryEnabled !== false)
+        .onChange((value) => { this.s.memoryEnabled = value; }));
   }
 
   // ===== 通信 =====

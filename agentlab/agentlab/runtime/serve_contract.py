@@ -30,11 +30,11 @@ CONFLICT_MESSAGE = "request in progress"
 
 class ErrorCode(IntEnum):
     """错误码枚举（HTTP 状态码 + 业务语义）"""
-
+    
     # 2xx 成功
     OK = 200
     CREATED = 201
-
+    
     # 4xx 客户端错误
     BAD_REQUEST = 400           # 请求格式错误、参数缺失
     UNAUTHORIZED = 401          # 鉴权失败
@@ -43,7 +43,7 @@ class ErrorCode(IntEnum):
     CONFLICT = 409              # 状态冲突（如会话已提交）
     UNPROCESSABLE = 422         # 语义错误（JSON 合法但业务不合法）
     DEPENDENCY_MISSING = 424    # 依赖服务不可用（如 MCP 工具不可达）
-
+    
     # 5xx 服务端错误
     INTERNAL_ERROR = 500        # 未分类的内部错误
     SERVICE_UNAVAILABLE = 503   # 服务降级（如记忆仓不可用）
@@ -51,7 +51,7 @@ class ErrorCode(IntEnum):
 
 class StandardResponse:
     """标准响应格式（所有 API 返回必须符合此结构）"""
-
+    
     @staticmethod
     def success(
         data: Any = None,
@@ -66,7 +66,7 @@ class StandardResponse:
             "request_id": request_id or _generate_request_id(),
             "data": data
         }
-
+    
     @staticmethod
     def error(
         code: ErrorCode,
@@ -99,7 +99,7 @@ async def request_id_middleware(request: web.Request, handler):
     """request_id 中间件：生成 UUID 并注入请求/响应"""
     request_id = _generate_request_id()
     request["request_id"] = request_id  # 注入 request 供后续使用
-
+    
     try:
         response = await handler(request)
         # 注入响应头（便于日志关联）
@@ -120,7 +120,7 @@ def make_json_response(
     """统一 JSON 响应构造（自动注入 request_id）"""
     if request_id and "request_id" not in data:
         data["request_id"] = request_id
-
+    
     resp = web.json_response(data, status=status)
     if request_id:
         resp.headers["X-Request-Id"] = request_id
@@ -132,27 +132,27 @@ def map_exception_to_error(
     request_id: Optional[str] = None
 ) -> tuple[ErrorCode, str]:
     """异常到错误码的映射规则"""
-
+    
     # ValidationError（Pydantic）
     if exc.__class__.__name__ == "ValidationError":
         return ErrorCode.BAD_REQUEST, f"validation failed: {exc}"
-
+    
     # ValueError（通用参数错误）
     if isinstance(exc, ValueError):
         return ErrorCode.BAD_REQUEST, str(exc)
-
+    
     # KeyError（缺少必需字段）
     if isinstance(exc, KeyError):
         return ErrorCode.BAD_REQUEST, f"missing required field: {exc}"
-
+    
     # PermissionError（权限不足）
     if isinstance(exc, PermissionError):
         return ErrorCode.FORBIDDEN, str(exc)
-
+    
     # FileNotFoundError（资源不存在）
     if isinstance(exc, FileNotFoundError):
         return ErrorCode.NOT_FOUND, str(exc)
-
+    
     # 其他未分类异常
     return ErrorCode.INTERNAL_ERROR, f"{type(exc).__name__}: {exc}"
 

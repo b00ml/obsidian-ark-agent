@@ -8,8 +8,12 @@
 
 每条给 importance（1-10）重要性评分，只输出 importance ≥ 4 的条目。content 用第三人称自包含的一句话，不依赖对话上下文也能读懂。
 
+每条还需给出两个自评字段：
+- "type"：建议的记忆类型，只能是 "context"（一般事实/偏好/状态）、"decisions"（带理由的明确决定）、"procedures"（可复用流程/方法）三者之一；不确定就填 "context"。禁止填其他值。
+- "confidence"：该条内容的可信度，取 0.0~1.0 或字符串 "hypothesis"。有多源佐证/明确陈述 → 0.9 左右；单一来源推断 → 0.6 左右；未经验证的猜测 → "hypothesis"。
+
 输出严格 JSON 数组（不要多余文本、不要代码块围栏），元素形如：
-{"content": "……", "tags": ["tag1", "tag2"], "importance": 7}
+{"content": "……", "tags": ["tag1", "tag2"], "importance": 7, "type": "context", "confidence": 0.9}
 
 最多 {{max_items}} 条；没有可提取内容时输出 []。
 

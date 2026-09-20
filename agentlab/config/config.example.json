@@ -10,13 +10,23 @@
     "light": "deepseek-chat",
     "heavy": "deepseek-reasoner"
   },
-  "vault_root": "C:/path/to/your/obsidian-vault",
+  "vault_root": "E:/peik1_books",
   "brain": {
     "config_path": "../../obsidian_agent_brain/config.json"
   },
   "memory": {
-    "dir": "C:/path/to/your/obsidian-vault/.agent-brain/memory",
-    "dedupe": true
+    "dir": "E:/peik1_books/.agent-brain/memory",
+    "dedupe": true,
+    "write_mode": "candidate_first",
+    "auto_promote": false,
+    "min_active_confidence": 0.85,
+    "candidate_ttl_days": 60,
+    "default_review_days": 90,
+    "recall_min_confidence": 0.65,
+    "allow_default_shared": true,
+    "quarantine_on_external_instruction": true,
+    "audit_path": ".agent-brain/memory/events.jsonl",
+    "retry_max_attempts": 3
   },
   "skills_dir": "skills",
   "trace_dir": "logs/trace",
@@ -42,13 +52,44 @@
     "token": "",
     "approval_timeout_seconds": 120
   },
+  "remote_operation": {
+    "base_url": "",
+    "status_path": "/operations/{operation_id}",
+    "token_env": "AGENT_REMOTE_OPERATION_TOKEN",
+    "timeout": 10,
+    "source": "remote-operation-api"
+  },
+  "context": {
+    "assembler_mode": "shadow",
+    "reserve_output_tokens": 16384,
+    "memory_budget_tokens": 1200,
+    "rag_budget_tokens": 4000,
+    "history_budget_tokens": 8000,
+    "task_state_path": "agentlab/runtime/task-state.db"
+  },
   "approval_mode": "risk_based",
   "danger_allowlist": [],
   "rag": {
     "vector_enabled": true,
     "embed_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "embed_model": "text-embedding-v4",
-    "embed_api_key": ""
+    "embed_api_key": "",
+    "vector_mode": "shadow",
+    "lexical_mode": "on",
+    "query_rewrite_mode": "off",
+    "query_rewrite_max_variants": 1,
+    "rewrite_deadline_ms": 250,
+    "query_expansion_mode": "shadow",
+    "query_expansion_max_variants": 5,
+    "query_expansion_min_candidates": 8,
+    "small_to_big_mode": "shadow",
+    "small_to_big_neighbors": 1,
+    "small_to_big_max_chars": 2400,
+    "chunk_strategy": "markdown-structure-v1-entry-tags-v1",
+    "index_version": "s1-p2-v1",
+    "index_backend": "auto",
+    "answer_gate_mode": "shadow",
+    "answer_gate_require_citation": true
   },
   "agents": {
     "_comment": "max_parallel_consults 超出名单进 summary.skipped；consult_result_max_chars 超限正文截断并归档 session range",
