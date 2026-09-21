@@ -7,7 +7,7 @@
 
 迁移前请自行备份 ark/memory（脚本不删除任何内容本体，只移动/重命名/聚合）。
 用法：
-  python -m agentlab.scripts.migrate_memory_to_buckets --vault-root E:/peik1_books [--dry-run]
+  python -m agentlab.scripts.migrate_memory_to_buckets --vault-root C:/path/to/your/obsidian-vault [--dry-run]
 """
 from __future__ import annotations
 

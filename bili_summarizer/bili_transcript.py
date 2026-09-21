@@ -1377,7 +1377,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-config", default=va.DEFAULT_CONFIG_PATH if va else "config/visual_models.json",
                         help="视觉模型配置文件路径 (默认: config/visual_models.json)")
     parser.add_argument("--vault", default=None,
-                        help="Obsidian Vault 路径，如 E:/peik1_books（提供后截图存入 raw/screenshots/，笔记写入 Inbox/）")
+                        help="Obsidian Vault 路径，如 C:/path/to/your/obsidian-vault（提供后截图存入 raw/screenshots/，笔记写入 Inbox/）")
     # ---- 频道级批量摄取（设计文档4.0 执行线#4）----
     parser.add_argument("--channel", default=None,
                         help="频道/合集/播放列表URL：枚举视频清单后批量入队（不直接连跑）")

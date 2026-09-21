@@ -1,5 +1,5 @@
 {
-  "vault_path": "E:/peik1_books",
+  "vault_path": "C:/path/to/your/obsidian-vault",
   "project_root": "e:/vibe_coding/obsidian_agent",
   "python": ".venv/Scripts/python.exe",
   "brain_dir": ".agent-brain",

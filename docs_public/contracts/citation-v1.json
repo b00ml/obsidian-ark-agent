@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "CitationStatus": {
+      "description": "Validity state for a citation used by an answer or artifact.",
+      "enum": [
+        "active",
+        "unverified",
+        "revoked",
+        "expired"
+      ],
+      "title": "CitationStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A source-bound reference that can be checked or revoked independently.",
+  "properties": {
+    "ref": {
+      "title": "Ref",
+      "type": "string"
+    },
+    "source_kind": {
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "source_hash": {
+      "default": "",
+      "title": "Source Hash",
+      "type": "string"
+    },
+    "project_id": {
+      "default": "",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "session_id": {
+      "default": "",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/CitationStatus",
+      "default": "active"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "ref",
+    "source_kind"
+  ],
+  "title": "Citation",
+  "type": "object"
+}

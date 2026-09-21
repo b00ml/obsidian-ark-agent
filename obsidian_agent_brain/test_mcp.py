@@ -3,7 +3,7 @@
 运行:
   .venv\\Scripts\\python.exe -m unittest obsidian_agent_brain/test_mcp.py
 
-写操作全部落在临时 Vault 目录，不污染真实 E:/peik1_books。
+写操作全部落在临时 Vault 目录，不污染真实 C:/path/to/your/obsidian-vault。
 """
 import json
 import os
@@ -42,7 +42,7 @@ def make_config(tmp_vault: str) -> dict:
 
 
 def fresh_vault() -> str:
-    """重建固定临时 Vault 目录并返回路径（不污染真实 E:/peik1_books）。"""
+    """重建固定临时 Vault 目录并返回路径（不污染真实 C:/path/to/your/obsidian-vault）。"""
     shutil.rmtree(TEST_VAULT, ignore_errors=True)
     os.makedirs(TEST_VAULT, exist_ok=True)
     return TEST_VAULT
@@ -770,7 +770,7 @@ class ObsidianCliToolsTest(unittest.TestCase):
     """Obsidian CLI 接入（优化设计文档4.0 执行线 #3）：探测 + 优雅降级 + 白名单。
 
     全程 mock shutil.which / subprocess.run，不依赖真实 Obsidian 安装；
-    写操作参数校验落在临时 Vault 路径字符串上，不碰真实 E:/peik1_books。
+    写操作参数校验落在临时 Vault 路径字符串上，不碰真实 C:/path/to/your/obsidian-vault。
     """
 
     def setUp(self):

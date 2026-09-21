@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "ProcessStatus": {
+      "description": "Shared lifecycle status for ingest, indexing and enrichment stages.",
+      "enum": [
+        "accepted",
+        "fetched",
+        "parsed",
+        "chunked",
+        "indexed",
+        "enriched",
+        "completed",
+        "failed",
+        "cancelled",
+        "retry",
+        "dead-letter"
+      ],
+      "title": "ProcessStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Normalised source identity shared by all ingestion adapters.",
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "source_kind": {
+      "title": "Source Kind",
+      "type": "string"
+    },
+    "source_ref": {
+      "title": "Source Ref",
+      "type": "string"
+    },
+    "title": {
+      "default": "",
+      "title": "Title",
+      "type": "string"
+    },
+    "content_hash": {
+      "default": "",
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "project_id": {
+      "default": "",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ProcessStatus",
+      "default": "accepted"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "id",
+    "source_kind",
+    "source_ref"
+  ],
+  "title": "SourceDocument",
+  "type": "object"
+}

@@ -1,0 +1,239 @@
+{
+  "schema": "obsidian-brain-mcp-tools-v1",
+  "tools": [
+    {
+      "name": "vault_read",
+      "module": "vault",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_search",
+      "module": "vault",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_graph",
+      "module": "vault",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_scan",
+      "module": "vault",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_health",
+      "module": "vault",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_write",
+      "module": "vault",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "vault_patch",
+      "module": "vault",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "brain_search",
+      "module": "brain",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "cache",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "brain_scan",
+      "module": "brain",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "cache",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "brain_reindex",
+      "module": "brain",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "index",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_commit",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": false,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_query",
+      "module": "memory",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_conflicts",
+      "module": "memory",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_correct",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": false,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_revoke",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_delete",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_restore",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "memory_review",
+      "module": "memory",
+      "permission": "write",
+      "timeout": null,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "bili_meta",
+      "module": "bili",
+      "permission": "read",
+      "timeout": 60.0,
+      "side_effects": "external",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "bili_transcribe",
+      "module": "bili",
+      "permission": "read",
+      "timeout": 1800.0,
+      "side_effects": "cache",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "bili_screenshot",
+      "module": "bili",
+      "permission": "write",
+      "timeout": 600.0,
+      "side_effects": "write",
+      "idempotent": false,
+      "requires_approval": false
+    },
+    {
+      "name": "bili_visual",
+      "module": "bili",
+      "permission": "write",
+      "timeout": 1800.0,
+      "side_effects": "write",
+      "idempotent": false,
+      "requires_approval": false
+    },
+    {
+      "name": "article_fetch",
+      "module": "article",
+      "permission": "read",
+      "timeout": 60.0,
+      "side_effects": "external",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "article_summarize",
+      "module": "article",
+      "permission": "write",
+      "timeout": 300.0,
+      "side_effects": "write",
+      "idempotent": false,
+      "requires_approval": false
+    },
+    {
+      "name": "inbox_collect",
+      "module": "inbox",
+      "permission": "write",
+      "timeout": 60.0,
+      "side_effects": "write",
+      "idempotent": true,
+      "requires_approval": false
+    },
+    {
+      "name": "inbox_read_queue",
+      "module": "inbox",
+      "permission": "read",
+      "timeout": null,
+      "side_effects": "none",
+      "idempotent": true,
+      "requires_approval": false
+    }
+  ]
+}

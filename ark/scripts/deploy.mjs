@@ -1,4 +1,4 @@
-// 部署构建产物到 Obsidian Vault（E:/peik1_books/.obsidian/plugins/ark）
+// Deploy build artifacts to an Obsidian Vault (set OBSIDIAN_VAULT_PATH).
 import { copyFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";

@@ -1,0 +1,135 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "agentlab serve",
+    "version": "v1"
+  },
+  "paths": {
+    "/v1/responses": {
+      "post": {
+        "summary": "Run an agent response",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE response stream"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Healthy"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ResponsesRequest": {
+        "description": "/v1/responses 请求体 schema（复用 pydantic，零新依赖，非法载荷直接 400）。\n\ninput 为消息数组、stream 为布尔、previous_response_id 为会话标识；\nrequest_id 为幂等键（§4.7）：同 id 重复提交由 serve 重放首次结果，避免重复烧 token/写库。\nproject_id（P0-2/OPT-107）：Project 长期任务空间——服务端据此注入项目规则/背景\n（<vault>/ark/projects/<id>/）；非法或不存在 → 静默降级为全局行为。\n其余字段（如前端 Hermes 兼容的 model/tools）放行忽略，不做强校验以免破坏现有客户端。",
+        "properties": {
+          "input": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Input"
+          },
+          "stream": {
+            "default": true,
+            "title": "Stream",
+            "type": "boolean"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Previous Response Id"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Request Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "multi": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Multi"
+          }
+        },
+        "title": "ResponsesRequest",
+        "type": "object"
+      }
+    }
+  },
+  "x-sse-events": [
+    "response.output_text.delta",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.completed",
+    "response.failed"
+  ]
+}

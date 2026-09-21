@@ -380,7 +380,7 @@ class RemoteOperationConfig(BaseModel):
 class Config(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     routes: dict[str, str] = {}  # 多模型路由：task_tier -> model
-    vault_root: str = "E:/peik1_books"
+    vault_root: str = "C:/path/to/your/obsidian-vault"
     brain: BrainConfig = Field(default_factory=BrainConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     skills_dir: str | None = None

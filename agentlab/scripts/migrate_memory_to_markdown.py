@@ -5,8 +5,8 @@ F5-011 Phase 2: 将现有 .agent-brain/memory/sessions.sqlite 记忆迁移到
 ark/memory/ Markdown 文件，保持向后兼容。
 
 使用方式：
-    python -m agentlab.scripts.migrate_memory_to_markdown --vault-root E:/peik1_books --dry-run
-    python -m agentlab.scripts.migrate_memory_to_markdown --vault-root E:/peik1_books
+    python -m agentlab.scripts.migrate_memory_to_markdown --vault-root C:/path/to/your/obsidian-vault --dry-run
+    python -m agentlab.scripts.migrate_memory_to_markdown --vault-root C:/path/to/your/obsidian-vault
 
 迁移逻辑：
 1. 读取 SQLite 所有记忆（id/content/tags/source_session/created_at）
@@ -251,7 +251,7 @@ def main():
     parser.add_argument(
         "--vault-root",
         required=True,
-        help="Obsidian vault root directory (e.g., E:/peik1_books)"
+        help="Obsidian vault root directory (e.g., C:/path/to/your/obsidian-vault)"
     )
     parser.add_argument(
         "--sqlite-path",

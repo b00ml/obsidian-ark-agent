@@ -8,7 +8,7 @@
   - build_note:     渲染 Obsidian 笔记（YAML frontmatter + 结构化正文）
 
 用法:
-  python article_summarizer.py <url> [--vault E:/peik1_books] [--output 自定义路径]
+  python article_summarizer.py <url> [--vault C:/path/to/your/obsidian-vault] [--output 自定义路径]
 
 关键约束（见 DESIGN-INGEST-PIPELINE.md §3.8 / 禁止事项 2）:
   - Prompt 必须走 bili_summarizer/prompts/article-summary-user.st + prompt_loader

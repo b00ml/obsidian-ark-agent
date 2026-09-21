@@ -10,12 +10,12 @@
     "light": "deepseek-chat",
     "heavy": "deepseek-reasoner"
   },
-  "vault_root": "E:/peik1_books",
+  "vault_root": "C:/path/to/your/obsidian-vault",
   "brain": {
     "config_path": "../../obsidian_agent_brain/config.json"
   },
   "memory": {
-    "dir": "E:/peik1_books/.agent-brain/memory",
+    "dir": "C:/path/to/your/obsidian-vault/.agent-brain/memory",
     "dedupe": true,
     "write_mode": "candidate_first",
     "auto_promote": false,

@@ -40,7 +40,7 @@ python -m unittest discover -s tests -v
 
 ```bash
 cd agentlab
-python -m agentlab.rag_index_drill --vault E:/peik1_books --run-id opt-xxx \
+python -m agentlab.rag_index_drill --vault C:/path/to/your/obsidian-vault --run-id opt-xxx \
   --out .tmp/roadmap/YYYYMMDD/opt-xxx/real-vault-drill.json
 ```
 
@@ -54,7 +54,7 @@ python -m agentlab.rag_index_drill --vault E:/peik1_books --run-id opt-xxx \
 
 ```bash
 cd agentlab
-python -m agentlab.memory_lifecycle_drill --vault E:/peik1_books --run-id opt-xxx \
+python -m agentlab.memory_lifecycle_drill --vault C:/path/to/your/obsidian-vault --run-id opt-xxx \
   --out .tmp/roadmap/YYYYMMDD/opt-xxx/memory-lifecycle.json
 ```
 
@@ -147,7 +147,7 @@ superseded_by: <mem-id>         # （可选）被哪条记忆替代
 ```python
 from agentlab.memory.consolidate import create_consolidator
 
-consolidator = create_consolidator("E:/peik1_books")
+consolidator = create_consolidator("C:/path/to/your/obsidian-vault")
 result = await consolidator.lifecycle(dry_run=True)
 ```
 
@@ -176,9 +176,9 @@ result = vault_search(query="项目中使用了哪些 LLM 模型？", top_k=5)
 ```bash
 cd agentlab
 python -m agentlab.scripts.migrate_memory_to_markdown \
-  --vault-root E:/peik1_books --dry-run
+  --vault-root C:/path/to/your/obsidian-vault --dry-run
 python -m agentlab.scripts.migrate_memory_to_markdown \
-  --vault-root E:/peik1_books --verify
+  --vault-root C:/path/to/your/obsidian-vault --verify
 ```
 
 脚本读取 `<vault>/.agent-brain/memory/sessions.sqlite`，按内容和标签推断类型，写入 `ark/memory/`，并在实际迁移后创建 `sessions.sqlite.pre-f5011` 备份。迁移期间 MCP 的 `memory_commit` / `memory_query` 签名保持兼容；OPT-223 后 Markdown 是唯一运行时读写源，Markdown 不可用/写入失败时显式报错（MEMORY_MARKDOWN_* 错误族），SQLite 仅保留迁移与人工恢复入口。

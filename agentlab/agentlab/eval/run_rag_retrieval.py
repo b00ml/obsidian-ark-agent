@@ -7,7 +7,7 @@ hybrid shadow 对照，避免把空路由当成质量基线。
 
 用法：
   python -m agentlab.eval.run_rag_retrieval \
-    --vault-root E:/peik1_books [--tasks PATH] [--out PATH]
+    --vault-root C:/path/to/your/obsidian-vault [--tasks PATH] [--out PATH]
 """
 from __future__ import annotations
 

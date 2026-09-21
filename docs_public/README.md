@@ -10,6 +10,7 @@
 - [configuration.md](configuration.md)：配置文件、环境变量、路径和密钥管理
 - [dependencies.md](dependencies.md)：Python、Node.js、系统命令和可选能力
 - [troubleshooting.md](troubleshooting.md)：诊断步骤与常见故障
+- [contracts/](contracts/)：HTTP、SSE、MCP 和数据模型的生成契约 schema
 
 ## 项目定位
 

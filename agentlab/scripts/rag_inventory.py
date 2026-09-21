@@ -5,7 +5,7 @@
 按当前 legacy-600 策略的预计 chunk 数、长度分位数、最近 7/30 天修改量、
 超长文件清单。用于《记忆系统机制与方法》§9.1 的 S0/S1 规模判定。
 
-用法：python -m agentlab.scripts.rag_inventory --vault-root E:/peik1_books [--out PATH]
+用法：python -m agentlab.scripts.rag_inventory --vault-root C:/path/to/your/obsidian-vault [--out PATH]
 """
 from __future__ import annotations
 

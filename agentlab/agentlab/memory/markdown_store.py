@@ -74,7 +74,7 @@ class MemoryMarkdownStore:
         Initialize Markdown memory store.
         
         Args:
-            vault_root: Absolute path to Obsidian vault root (e.g., E:/peik1_books)
+            vault_root: Absolute path to Obsidian vault root (e.g., C:/path/to/your/obsidian-vault)
             create_dirs: Create the standard memory directories when missing.
                 Read-only callers such as evaluators should pass ``False``.
         """
