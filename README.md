@@ -75,6 +75,10 @@ npm run build
 - 写入操作经过路径守卫、审批和结构化校验。
 - Prompt 使用独立模板文件，模型配置由示例配置驱动。
 
+## 公开文档
+
+完整的架构、模块、安装运行、配置、依赖和故障排查说明见 [`docs_public/`](docs_public/README.md)。
+
 ## License
 
 MIT License，详见 [LICENSE](LICENSE)。
