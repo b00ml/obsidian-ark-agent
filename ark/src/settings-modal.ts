@@ -305,7 +305,7 @@ export class SettingsModal extends Modal {
       });
     new Setting(this.content).setName("Agentlab 模型").setDesc("agentlab 内 model 名，默认 agentlab-demo").addText((t) => t.setValue(this.s.agentlabModel || "agentlab-demo").onChange((v) => { this.s.agentlabModel = v; }));
     new Setting(this.content).setName("Agentlab Python").setDesc("「AI 助手」一键拉起 serve 的 python 可执行文件；留空自动探测项目 .venv").addText((t) => t.setPlaceholder("留空自动（项目 .venv）").setValue(this.s.agentlabExePath || "").onChange((v) => { this.s.agentlabExePath = v; }));
-    new Setting(this.content).setName("Agentlab 目录").setDesc("serve 启动目录（须含 config/config.json）；留空使用当前项目的 agentlab 目录").addText((t) => t.setPlaceholder("agentlab").setValue(this.s.agentlabWorkdir || "").onChange((v) => { this.s.agentlabWorkdir = v; }));
+    new Setting(this.content).setName("Agentlab 目录").setDesc("serve 启动目录（须含 config/config.json）；留空默认项目 agentlab 目录").addText((t) => t.setPlaceholder("agentlab").setValue(this.s.agentlabWorkdir || "").onChange((v) => { this.s.agentlabWorkdir = v; }));
     new Setting(this.content)
       .setName("Hermes Desktop 路径")
       .setDesc("点「AI 助手」优先拉起桌面 GUI（Hermes.exe），留空则回退 CRT 终端")

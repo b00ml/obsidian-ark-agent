@@ -64,7 +64,6 @@ def export(out_dir: Path) -> None:
 
 if __name__ == "__main__":
     check_only = "--check" in sys.argv
-    # Public releases keep generated interface schemas beside the public docs.
     target = ROOT / "docs_public" / "contracts"
     if check_only:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,4 +1,4 @@
-// Deploy build artifacts to an Obsidian Vault (set OBSIDIAN_VAULT_PATH).
+// 部署构建产物到 Obsidian Vault（C:/path/to/your/obsidian-vault/.obsidian/plugins/ark）
 import { copyFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
